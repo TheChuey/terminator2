@@ -1,0 +1,342 @@
+=================================================================
+ the_entire_enchilada_v1-9.txt
+ UPDATES SINCE: the_entire_enchilada_v1-8.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.8)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-8.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+A bug-fix + UX round driven by the app's real usage:
+
+  - "SAVE TO MEMORY" ON THE REAL CHAT UI. The user chats on the
+    standalone `static/chat.html` page (the window.open target), NOT the
+    index.html flyout widget the V1.8 header toggle was built for. So the
+    standalone page gained its own "Save to memory" checkbox in the
+    header, plus the `rag` flag on both message creation and finalize:
+
+      * new header toggle `#sc-rag` (`.sc-rag-toggle`) rendered before
+        the Save button, defaulting to `settings.rag.commitOnSave`;
+      * `sendChat()` now POSTs `rag`, so a chat created from chat.html
+        stamps the server session flag on the FIRST message too;
+      * `finalizeActiveChat()` now POSTs `{ title, rag }` to
+        `/api/chats/end` on every save.
+
+  - "SAVED CHATS DIDN'T LAND WHERE I CONFIGURED". Root cause: paths are
+    resolved ONCE at import in app/paths.py, and the running server was
+    started BEFORE the user saved `dataDir: "E:\\data\\rag_store"` and
+    `ragDbPath: "E:\\data\\db"`. It kept writing transcripts to the old
+    `chatSavePath` (`E:\saved from app`) and the store to the old
+    `data\rag_db`. Two fixes:
+
+      * `app/paths.py` now snapshots the stored path keys at import and
+        exposes `restart_needed()`; `GET /api/settings` returns
+        `restartNeeded: true` when the file changed since the server
+        started, and the configuration UI shows an amber warning banner
+        telling the user to restart the server.
+      * Field notes in the config form now spell out that transcripts
+        follow "Chat save path" (NOT the Data folder; blank =
+        `<dataDir>\chatlog\agent-text-records`) and that path changes
+        apply after a restart; a new ragDbPath starts an empty store.
+
+  - CONFIG DATA MIGRATED (filesystem, not code). To match the user's
+    configured folders:
+      * `chatSavePath` was REMOVED from `static/config/app_settings.json`
+        so transcripts now resolve to `<dataDir>/chatlog/agent-text-records`
+        (`E:\data\rag_store\chatlog\agent-text-records`).
+      * `E:\saved from app\*.txt` (5 transcripts) moved to that new folder.
+      * `data\chatlog\chatRecord.jsonl` + `.active-chat.json` moved to
+        `E:\data\rag_store\chatlog\` so the saved-chat dropdown survives.
+      * Empty `data\chat-transcripts` and `data\chatlog` removed. The old
+        RAG store `data\rag_db` is LOCKED by the running server (chroma
+        file handles); it stays until the server is stopped, then the
+        user deletes it. The fresh store creates at `E:\data\db` on next
+        start (auto-ingest is on, so it re-indexes the moved transcripts
+        on first search).
+
+  - DOCS RE-SYNC. `documentation/_make_snapshot.py` + this v1-9 delta;
+    `APP_SNAPSHOT.md` regenerated (still 52 files, 9 changelogs);
+    small README note added.
+
+=================================================================
+ 2. FILE: static/chat.html                      (CHANGED - THIS ROUND)
+=================================================================
+Two additions, both in the standalone chat page.
+
+  2.1  Header markup ("Save to memory" toggle before the Save button):
+           <label
+               class="sc-rag-toggle"
+               title="Add this chat to the agent's RAG memory on save">
+               <input
+                   type="checkbox"
+                   id="sc-rag" />
+               Save to memory
+           </label>
+
+  2.2  New CSS block after `.sc-header-actions`:
+           .sc-rag-toggle { display:inline-flex; align-items:center;
+               gap:6px; height:34px; padding:0 11px;
+               border:1px solid rgba(255,255,255,.12);
+               border-radius:var(--radius-small);
+               background:rgba(255,255,255,.10); color:white;
+               font-size:12px; font-weight:600; cursor:pointer;
+               user-select:none; white-space:nowrap; }
+           .sc-rag-toggle:hover { background:rgba(255,255,255,.20); }
+           .sc-rag-toggle input { accent-color:var(--color-accent,#6ea8ff);
+               cursor:pointer; width:14px; height:14px; margin:0; }
+
+  2.3  DOM ref added after `chatTitle`:
+           ragToggle:
+               document.getElementById(
+                   "sc-rag"
+               ),
+
+  2.4  Default from the stored behavior, right after the settings fetch
+       succeeds (settings already load into a module-level `settings`):
+           if (DOM.ragToggle && settings.rag) {
+               DOM.ragToggle.checked =
+                   Boolean(settings.rag.commitOnSave);
+           }
+
+  2.5  `sendChat()` body gains the flag (applied on the first message so
+       the server session is stamped):
+           rag: DOM.ragToggle.checked
+
+  2.6  `finalizeActiveChat()` body gains the flag (was `{ title }`):
+           body: JSON.stringify({
+               title,
+               rag: DOM.ragToggle.checked
+           })
+
+=================================================================
+ 3. FILE: app/paths.py                          (CHANGED - THIS ROUND)
+=================================================================
+  3.1  Module docstring note added ("`restart_needed()` tells callers
+       when a restart is required.").
+  3.2  Right after the import-time config load, a snapshot of the path
+       keys is captured:
+           _PATH_KEYS = ("dataDir", "chatSavePath", "ragDbPath")
+           _path_keys_at_import = {key: _get_text(_cfg.get(key))
+                                   for key in _PATH_KEYS}
+  3.3  New public function:
+           def restart_needed() -> bool:
+               """True when stored path settings changed since import -
+               the running server is still using the old resolved
+               locations until a restart."""
+               current = _load_app_settings()
+               for key in _PATH_KEYS:
+                   if (_get_text(current.get(key))
+                           != _path_keys_at_import.get(key)):
+                       return True
+               return False
+
+=================================================================
+ 4. FILE: server.py                             (CHANGED - THIS ROUND)
+=================================================================
+`GET /api/settings` now returns the stored settings PLUS a restart-needed
+flag so the config UI can warn the user that path changes require a
+server restart:
+
+    payload = _load_json(APP_SETTINGS_FILE, {})
+    return {
+        "settings": payload,
+        "restartNeeded": paths.restart_needed(),
+    }
+
+(`paths` was already imported at line 24; no import change.)
+
+=================================================================
+ 5. FILE: static/js/api/api.js                  (CHANGED - THIS ROUND)
+=================================================================
+New helper next to `loadAppSettings`:
+
+    export async function loadAppSettingsWithMeta() {
+        const data = await request("/api/settings");
+        return {
+            settings: data.settings || {},
+            restartNeeded: Boolean(data.restartNeeded),
+        };
+    }
+
+`loadAppSettings` is unchanged (still returns just `.settings`), so
+existing callers are unaffected.
+
+=================================================================
+ 6. FILE: static/js/ui/config.js                (CHANGED - THIS ROUND)
+=================================================================
+  6.1  Import swaps `loadAppSettings` -> `loadAppSettingsWithMeta`.
+  6.2  The parallel fetch now also returns the meta flags:
+           [agents, models, meta] = await Promise.all([...]);
+           settings = meta.settings;
+           restartNeeded = meta.restartNeeded;
+       (`settings`/`restartNeeded`/`meta` are all `let` at the top.)
+  6.3  New amber banner rendered before the form when a restart is
+       needed:
+           if (restartNeeded) {
+               const notice = el("div", "status-message warn");
+               notice.textContent =
+                 "Path settings changed - restart the server for the new
+                  folders to take effect.";
+               mount.appendChild(notice);
+           }
+
+=================================================================
+ 7. FILE: static/js/ui/config-form.js           (CHANGED - THIS ROUND)
+=================================================================
+Labor-note/wording only - no new controls this round:
+  - "Chat save path" note now reads "...SEPARATE from the Data folder -
+    transcripts follow this field, not Data folder. Blank = a chatlog
+    sub-folder inside the Data folder."
+  - "Data folder" note appends "...Path changes apply after a server
+    restart."
+  - "RAG database path" note now reads "...Blank = data folder\rag_db.
+    Absolute path or relative to the project root; a new path starts an
+    empty store. Path changes apply after a server restart."
+
+=================================================================
+ 8. FILE: static/css/styles.css                 (CHANGED - THIS ROUND)
+=================================================================
+One line added after `.status-message.error`:
+    .status-message.warn   { color: var(--color-warning); }
+
+=================================================================
+ 9. FILE: static/config/app_settings.json       (CHANGED - THIS ROUND)
+=================================================================
+  - REMOVED the `chatSavePath` key (was "E:\\saved from app") so
+    transcripts resolve to `<dataDir>/chatlog/agent-text-records`.
+  - Already present from user saves: `dataDir: "E:\\data\\rag_store"`,
+    `ragDbPath: "E:\\data\\db"`, `rag: { commitOnSave: false,
+    autoIngest: true }`, plus a new `rag_assistant` chat test
+    ("name species of cats").
+
+=================================================================
+ 10. DATA MIGRATION PERFORMED                    (FILESYSTEM, NOT CODE)
+=================================================================
+The following moves happened on disk to honor the configured folders:
+  - `E:\saved from app\what-is-my-pin-code.txt`, `hi.txt`,
+    `lets-make-a-plan.txt`, `rag-assistante-test.txt`,
+    `rag-assistante-test-2.txt` -> `E:\data\rag_store\chatlog\
+    agent-text-records\`
+  - `data\chatlog\chatRecord.jsonl` + `.active-chat.json` ->
+    `E:\data\rag_store\chatlog\`
+  - Removed empty `data\chat-transcripts` and `data\chatlog`.
+  - Old store `data\rag_db` is LOCKED by the running server (chroma file
+    handles); deletion is a TODO for the running-process owner: stop the
+    server, then delete `E:\terminator2\data\rag_db`. `E:\saved from app`
+    is now empty.
+
+=================================================================
+ 11. FILE: documentation/_make_snapshot.py      (CHANGED - THIS ROUND)
+=================================================================
+  11.1  CHANGELOGS list now archives v1-9 too (9 entries); the archive
+        header note "(v1-1 .. v1-8)" -> "(v1-1 .. v1-9)".
+  11.2  TREE (Section 1) gains a `the_entire_enchilada_v1-9.txt` row in
+        the documentation/ listing.
+  11.3  DOCSCRIPT_PROMPT refreshed: changelog list runs to v1-9; the
+        "next delta" example becomes `the_entire_enchilada_v1-10.txt`.
+  11.4  FILES manifest UNCHANGED - every edited file (server.py,
+        app/paths.py, static/chat.html, static/config/app_settings.json,
+        static/css/styles.css, static/js/api/api.js, static/js/ui/config.js,
+        static/js/ui/config-form.js) is already in the 52-file manifest.
+
+=================================================================
+ 12. FILE: documentation/APP_SNAPSHOT.md         (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits): Section 2 embeds the same 52 files with the updated
+contents above; Section 3 archives 9 changelogs (v1-1 .. v1-9);
+Section 1 tree + Section 4 docscript carry the v1-9 row.
+
+=================================================================
+ 13. FILE: README.md                             (CHANGED - THIS ROUND)
+=================================================================
+The "### RAG memory store" section gained a short note that the
+standalone chat.html has its own "Save to memory" toggle and that the
+config page shows a restart-needed banner when stored path settings no
+longer match the running server.
+
+=================================================================
+ 14. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `python -m py_compile server.py app/paths.py` - both compile.
+   - `node --check` passes for api.js, config.js, config-form.js.
+   - Paths smoke test (fresh import): DATA_DIR=E:\data\rag_store,
+     RECORDS_DIR=E:\data\rag_store\chatlog\agent-text-records,
+     RAG_DB_DIR=E:\data\db; `restart_needed()` -> False on a fresh
+     import and True when the import-time snapshot is stale.
+   - Migration verified on disk: 5 transcripts + chatRecord.jsonl +
+     .active-chat.json under E:\data\rag_store\chatlog; E:\saved from
+     app now empty; data\chat-transcripts + data\chatlog removed.
+   - `python documentation/_make_snapshot.py` ran clean, 52 files / 9
+     changelogs, APP_SNAPSHOT.md regenerated.
+   - chat.html edits reviewed in place (toggle markup + DOM ref +
+     settings default + rag on send/finalize); inline JS not
+     node-checkable, verified by inspection.
+
+=================================================================
+ 15. FILES NOT CHANGED (confirmed byte-for-byte this round)
+=================================================================
+   - app/core/agent.py, app/core/llm.py, app/core/prompt.py
+   - app/agents/loader.py, app/agents/registry.py, app/agents/factory.py
+   - app/tools/registry.py, app/tools/files.py, app/tools/workspace.py,
+     app/tools/datetime_tools.py, app/tools/search.py, app/tools/web.py
+   - app/chat_store/__init__.py, app/chat_store/logger.py,
+     app/chat_store/store.py
+   - app/rag_commit.py, rag/ingest.py, rag/search.py, rag/main.py
+   - agent_library/basic_chat/*, agent_library/dev_assistant/*,
+     agent_library/problem_discovery_agent/*, agent_library/rag_assistant/*
+   - config/models.json, config/settings.json
+   - static/index.html
+   - static/js/app.js, static/js/classes/ChatSession.js,
+     static/js/classes/chat-window.js, static/js/logic/models.js,
+     static/js/logic/chat-formatter.js, static/js/ui/markdown.js,
+     static/js/ui/agents.js, static/js/ui/appearance.js,
+     static/js/ui/chat-tests.js
+   - scripts/version_chats.py, scripts/rebuild_rag.py, requirements.txt
+   - documentation/CREATING_AGENTS.md
+   - the_entire_enchilada.txt and v1.txt .. v1-8.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 16. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-9.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-8.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (notably everything
+   under `static/js/`, `static/css/`, `static/`, and the backend under
+   `app/` and `rag/`) against the versions/descriptions captured in
+   `the_entire_enchilada_v1-9.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-10.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).

@@ -1,0 +1,11 @@
+{
+  "id": "rag_assistant",
+  "name": "RAG Assistant",
+  "description": "Chat-memory assistant that recalls past sessions by searching the local RAG database.",
+  "mode": "agent",
+  "model": "gemma4:e2b",
+  "tools": [
+    "search_chat_logs",
+    "get_current_date"
+  ]
+}

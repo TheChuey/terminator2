@@ -1,0 +1,559 @@
+=================================================================
+ the_entire_enchilada_v1-8.txt
+ UPDATES SINCE: the_entire_enchilada_v1-7.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.7)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-7.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+Two coupled rounds of work, both requested by the user through the app:
+
+  - FUNCTIONAL RAG MEMORY. The prototype `rag/` module (ingest/search/
+    main) is now wired into the live server as a persistent memory store
+    the agents can recall with the `search_chat_logs` tool:
+
+      * A brand-new config module, `app/paths.py`, is the single source
+        of truth for every runtime folder. The UI configuration
+        (`static/config/app_settings.json`) can now relocate the data
+        folder, the chat-save transcripts folder, and the RAG database
+        (`dataDir`, `chatSavePath`, `ragDbPath`). Absolute values are
+        used verbatim; relative values resolve against the project root.
+        This also fixed a real bug: the first `resolve_path()` version
+        joined an absolute configured path onto the fallback, so
+        `chatSavePath: "E:\\saved from app"` was silently dropped.
+
+      * A brand-new `app/rag_commit.py` commits ONE finalized chat
+        transcript into the store, and exposes purge/rebuild/status so
+        the store can be forgotten or re-indexed without hand-hacking
+        the chroma folder.
+
+      * Chat sessions now carry a `rag` flag ("save to memory"). A
+        per-chat toggle in the chat header controls it; the default
+        comes from the new `rag.commitOnSave` setting (default false).
+        On finalize, chats marked for memory are committed into the
+        RAG store (never blocks the save itself).
+
+      * `search_chat_logs` self-heals an EMPTY store exactly once per
+        process by indexing every transcript - but only when the new
+        `rag.autoIngest` setting is on (default true).
+
+      * New server endpoints `GET /api/rag/status`,
+        `POST /api/rag/rebuild`, `POST /api/rag/reset`, and new
+        `scripts/rebuild_rag.py` CLI (`build|purge|status`).
+
+      * A new discovered agent `agent_library/rag_assistant/` - a
+        dedicated memory-recall chat agent that uses `search_chat_logs`.
+
+  - FRONTEND CONFIG + STORE MANAGEMENT. The configuration panel gained
+    Data folder / RAG database path fields, two RAG behavior toggles,
+    and a live RAG-store status line with "Forget everything" /
+    "Rebuild memory" buttons. The flyout chat got a configurable
+    header toggle ("Save to memory") and the JS API client grew
+    `ragStatus()` / `rebuildRag()` / `resetRag()`.
+
+  - DOCS RE-SYNC. `README.md`, `documentation/CREATING_AGENTS.md`,
+    `documentation/_make_snapshot.py` and `documentation/APP_SNAPSHOT.md`
+    were updated to capture the new RAG architecture, and this delta
+    file (v1-8) was written.
+
+=================================================================
+ 2. NEW FILE: app/paths.py                              (ADDED)
+=================================================================
+Config-driven path resolution module. Adds the keys to
+`static/config/app_settings.json`:
+
+        dataDir        base data folder (default "data"); relative ->
+                       project root, absolute -> used as-is
+        chatSavePath   where saved chat transcripts (.txt) are written;
+                       empty -> <dataDir>/chatlog/agent-text-records
+        ragDbPath      where the RAG store (chroma.sqlite3) lives;
+                       empty -> <dataDir>/rag_db
+        rag            { commitOnSave: bool, autoIngest: bool }
+
+Module-level resolved constants: `BASE_DIR`, `DATA_DIR`, `CHATS_DIR`,
+`CHAT_SAVE_PATH`, `RECORDS_DIR`, `CHAT_RECORDS_DIR` (alias), `RAG_DB_DIR`,
+`LOG_FILE`, `ACTIVE_SESSION_FILE`, `HISTORY_FILE`, `EXPORTS_DIR`,
+`APP_SETTINGS_FILE`, `SERVER_SETTINGS_FILE`. Live functions:
+
+    resolve_path(raw, *fallback_parts) -> Path   # empty raw -> BASE_DIR/parts
+    _rooted(raw, default: Path) -> Path          # empty raw -> default
+    rag_config(default_commit=None) -> dict      # commitOnSave + autoIngest
+    about() -> dict                              # human-readable resolved paths
+
+The `_rooted` helper is the corrected core: a present configured value is
+used verbatim (`Path(text)` when absolute, `BASE_DIR / text` when
+relative); nothing is re-joined onto it. `resolve_path` keeps the fallback
+semantics for `dataDir`. Paths resolve at import time - restart the server
+after editing path settings (rag behavior toggles read live).
+
+=================================================================
+ 3. NEW FILE: app/rag_commit.py                        (ADDED)
+=================================================================
+Commit / maintain the persistent RAG store. Public API:
+
+    commit_transcript(transcript: Path) -> str   # ingest ONE file, upsert
+    purge_store() -> str                          # delete store contents
+    rebuild_store() -> str                        # re-index all transcripts
+    status() -> dict                              # path + chunk count + config
+    _chunk_count() -> int                         # direct sqlite count
+
+`commit_transcript` is called from `store._finalize_locked`; it ingests the
+just-written transcript file (`rag.ingest.ingest_file`), upserts the
+segments through `rag.search.RAGStorage(persist_dir=paths.RAG_DB_DIR)` and
+is wrapped in try/except by the caller so a failed commit never blocks the
+chat save. `purge_store` removes `chroma.sqlite3` /
+`fallback_vector_db.json` plus leftover segment dirs. `status()` also
+returns `paths.rag_config()` and `paths.about()` for the UI.
+
+=================================================================
+ 4. FILE: app/chat_store/store.py                 (CHANGED - THIS ROUND)
+=================================================================
+  4.1  All path constants now come from `app.paths`:
+          DATA_DIR        = paths.DATA_DIR
+          CHATS_DIR       = paths.CHATS_DIR
+          RECORDS_DIR     = paths.RECORDS_DIR
+          LOG_FILE        = paths.LOG_FILE
+          ACTIVE_SESSION_FILE = paths.ACTIVE_SESSION_FILE
+          APP_SETTINGS_FILE   = paths.APP_SETTINGS_FILE
+       (module docstring row "_LOG_FILE / ACTIVE_SESSION_FILE / RECORDS_DIR
+        <- app/paths" added).
+
+  4.2  `rag` flag through the session lifecycle:
+       - `ensure_session(agent, session_id, title, new_chat, rag=None)` -
+         new `rag: bool | None` parameter. `None` -> the stored
+         `commitOnSave` default applies (the comment explains this).
+       - `_create_locked(agent, title="", rag=None)` resolves
+             if rag is None:
+                 rag = paths.rag_config()["commitOnSave"]
+         then stamps the new session dict with
+             "rag": bool(rag),
+         and the startup log line becomes
+             print(f"[CHATS] started session '{session['id']}' for "
+                   f"'{session['agentId']}' (rag={session['rag']})")
+       - `finalize_session(title=None, rag=None)` and
+         `_finalize_locked(title=None, rag=None)` accept the override and,
+         after writing the transcript + metadata log:
+             # Commit to the RAG store when the chat is marked for memory ...
+             commit = rag if rag is not None else bool(session.get("rag", False))
+             if commit:
+                 try:
+                     from app.rag_commit import commit_transcript
+                     commit_transcript(target)
+                 except Exception as e:
+                     print(f"[CHATS] RAG commit failed (chat still saved): {e}")
+       The save itself is unaffected - the commit is best-effort.
+
+=================================================================
+ 5. FILE: app/chat_store/logger.py                 (CHANGED - THIS ROUND)
+=================================================================
+`DEFAULT_LOG_FILE` (and the session log file) are now resolved through
+`app.paths` so the UI-configured data folder controls the JSONL location,
+with a static fallback when `app.paths` cannot be imported:
+
+    try:
+        from app import paths as _app_paths
+    except Exception:  # pragma: no cover
+        _app_paths = None
+    DEFAULT_LOG_FILE = (
+        _app_paths.LOG_FILE
+        if _app_paths is not None
+        else Path(__file__).resolve().parent.parent.parent / "data" / "chatlog" / "chatRecord.jsonl"
+    )
+
+=================================================================
+ 6. FILE: app/tools/search.py                     (CHANGED - THIS ROUND)
+=================================================================
+The hardcoded `ROOT_DIR / data / ...` paths are replaced with `app.paths`;
+the self-heal is now gated behind `rag.autoIngest`.
+
+      6.1  New constants / helpers at the top:
+               from app import paths
+               RAG_DB_DIR = paths.RAG_DB_DIR
+               CHAT_RECORDS_DIR = paths.CHAT_RECORDS_DIR
+               _rag_ingested = False
+
+               def _auto_ingest_enabled() -> bool:
+                   """Only explicit commits / rebuild when the UI turned
+                   auto-loading off."""
+                   return bool(paths.rag_config()["autoIngest"])
+
+      6.2  `_ensure_rag_ingested(storage)` now returns early when
+           auto-ingest is disabled:
+               if _rag_ingested:
+                   return True
+               if not _auto_ingest_enabled():
+                   return False
+
+      6.3  `search_chat_logs` builds the storage from
+           `RAGStorage(persist_dir=str(RAG_DB_DIR))` (was
+           `ROOT_DIR / "data" / "rag_db"`). Everything else unchanged.
+
+=================================================================
+ 7. FILE: server.py                              (CHANGED - THIS ROUND)
+=================================================================
+  7.1  Imports + constants now resolve through app/paths:
+           from app import paths
+           DATA_DIR = paths.DATA_DIR
+           HISTORY_FILE = paths.HISTORY_FILE
+           EXPORTS_DIR = paths.EXPORTS_DIR
+           APP_SETTINGS_FILE = paths.APP_SETTINGS_FILE
+       (comment: "Folder locations resolve through app.paths so the UI
+        configuration can relocate the data folder.")
+
+  7.2  ChatRequest gains the per-chat memory flag:
+           rag: bool = False         # commit this chat to the RAG memory
+                                     # store on save
+
+  7.3  The /api/chat handler passes it through:
+           session = chat_store.ensure_session(
+               agent, session_id=data.session_id, title=data.title,
+               new_chat=data.new_chat, rag=data.rag)
+
+  7.4  /api/chats/end accepts a `rag` override (bool only; None falls back
+       to the chat's stored flag / commitOnSave default):
+           rag = payload.get("rag")
+           row = chat_store.finalize_session(
+               title=payload.get("title") or payload.get("chatTitle"),
+               rag=rag if isinstance(rag, bool) else None)
+
+  7.5  NEW "RAG MEMORY STORE" block (three endpoints, importing from
+       app.rag_commit lazily inside each handler):
+           @app.get("/api/rag/status")     -> {"status": status()}
+           @app.post("/api/rag/rebuild")   -> {"message": rebuild_store()}
+           @app.post("/api/rag/reset")     -> {"message": purge_store()}
+
+=================================================================
+ 8. FILE: rag/ingest.py                        (CHANGED - THIS ROUND)
+=================================================================
+New `ingest_file(file_path, chunk_size=500, overlap=50)` extracted so ONE
+transcript can be indexed (per-chat commits) as well as a whole folder.
+`ingest_directory` now loops `ingest_file` per `.txt`:
+
+    for txt_file in txt_files:
+        all_chunks.extend(ingest_file(txt_file, chunk_size=chunk_size, overlap=overlap))
+
+`ingest_file` reads the file, parses header + turns, wraps each sliding
+chunk with the `[title | Turn N | speaker]` context label, and returns the
+`{text, raw_chunk, metadata}` dicts. No behavioral change to chunking.
+
+=================================================================
+ 9. FILE: rag/search.py                        (CHANGED - THIS ROUND)
+=================================================================
+In `RAGStorage.add_chunks`, the per-document insert switches `add` -> upsert
+(with `add` as fallback) so re-committing a chat version or re-running a
+rebuild overwrites segments instead of raising duplicate-id errors.
+
+=================================================================
+ 10. FILE: rag/main.py                         (CHANGED - THIS ROUND)
+=================================================================
+The CLI now resolves its defaults through `app.paths` when running inside
+the Terminator1 app, keeping cwd-relative fallbacks when standalone:
+
+    try:
+        from app import paths as app_paths
+        default_chat_logs = str(app_paths.CHAT_RECORDS_DIR)
+        default_persist = str(app_paths.RAG_DB_DIR)
+    except Exception:
+        default_chat_logs = "./data/chatlog/agent-text-records"
+        default_persist = "./data/rag_db"
+
+The prompt uses `default_chat_logs`; persistence uses `default_persist`.
+
+=================================================================
+ 11. NEW FILE: scripts/rebuild_rag.py                 (ADDED)
+=================================================================
+No-arg CLI for store maintenance; the actual work is reused from
+`app.rag_commit`:
+
+    python scripts/rebuild_rag.py [build|purge|status]
+      build   (default) re-index every transcript into the store
+      purge   delete the store so it starts empty (transcripts kept)
+      status  show store path + chunk count + current RAG behavior
+
+Bootstraps `sys.path` with the project root, imports `app.paths` + the
+commit functions, and prints the per-command summary.
+
+=================================================================
+ 12. NEW FILES: agent_library/rag_assistant/          (ADDED)
+=================================================================
+A new auto-discovered agent for chat-memory recall.
+
+  agent.json:
+      {
+        "id": "rag_assistant",
+        "name": "RAG Assistant",
+        "mode": "agent",
+        "model": "gemma4:e2b",
+        "description": "Chat-memory assistant that recalls past sessions by
+                        searching the local RAG database.",
+        "tools": ["search_chat_logs", "get_current_date"]
+      }
+
+  agent.md:
+      A "RAG Assistant" personality document. It instructs the agent to use
+      `search_chat_logs` to recall past sessions, translate temporal
+      keywords ("yesterday", "last session", "a few days ago") into
+      topical queries, and fix typos before searching. Includes an
+      example Q/A flow and "just retrieve - do not fabricate" guidance.
+
+=================================================================
+ 13. FILE: static/js/classes/chat-window.js   (CHANGED - THIS ROUND)
+=================================================================
+The flyout widget hides the side panel (`rightPanel` is forced off), so
+per-chat controls had nowhere to live. Added a config-driven header toggle:
+
+  13.1  Config surface: `config.headerToggle` ({ name, label, value }).
+        In `_buildHeader`, after the flyout agent-select (because the
+        widget's panel is disabled in flyout mode) it renders:
+            <label class="cw-header-toggle">
+              <input type="checkbox" data-name="{name}" checked={value}>
+              <span class="cw-header-toggle-label">{label}</span>
+            </label>
+        and stores the checkbox element on `this._headerToggle`.
+
+  13.2  `getPanelValues()` now merges the header toggle in, so the app
+        reads `widget.getPanelValues().ragCommit` uniformly whether the
+        panel exists or not:
+            getPanelValues() {
+                const values = this.panel ? this.panel.getValues() : {};
+                if (this._headerToggle) {
+                    values[this._headerToggle.dataset.name] =
+                        this._headerToggle.checked;
+                }
+                return values;
+            }
+
+  13.3  `this._headerToggle = null` added to the DOM reference cache.
+
+=================================================================
+ 14. FILE: static/js/app.js                    (CHANGED - THIS ROUND)
+=================================================================
+  14.1  `buildAgentConfig(agent)` now reads the stored default and passes
+        the header toggle into the widget config:
+            const commitOnSave =
+                settings.rag && typeof settings.rag.commitOnSave === "boolean"
+                    ? settings.rag.commitOnSave
+                    : false;
+            ...
+            headerToggle: {
+                name: "ragCommit",
+                label: "Save to memory",
+                value: commitOnSave,
+            },
+
+  14.2  `handleSend` sends the flag with each message (used when the chat's
+        first message creates the session).
+            rag: Boolean(panelValues.ragCommit),
+
+  14.3  `handleSaveAction` passes it as a finalize override (in the old
+        inline request):
+            const result = await api.endChat({
+                title,
+                rag: Boolean(widget.getPanelValues().ragCommit),
+            });
+
+=================================================================
+ 15. FILE: static/js/api/api.js               (CHANGED - THIS ROUND)
+=================================================================
+  15.1  `sendChat` accepts `rag = false` and serializes it:
+            export async function sendChat({ ..., rag = false }) {
+                body: JSON.stringify({ ..., rag })
+  15.2  `endChat({ title = "", rag = undefined })` only sends the flag
+        when it is an explicit boolean:
+            if (typeof rag === "boolean") body.rag = rag;
+  15.3  Three new RAG store helpers:
+            ragStatus()       -> GET  /api/rag/status
+            rebuildRag()      -> POST /api/rag/rebuild
+            resetRag()        -> POST /api/rag/reset
+
+=================================================================
+ 16. FILE: static/js/ui/config-form.js        (CHANGED - THIS ROUND)
+=================================================================
+  16.1  Two new path fields between the chat-save path and the versioning
+        toggle:
+            "Data folder"      (id data-dir-path, default "data")
+            "RAG database path" (id rag-db-path, empty -> default)
+        built through a new `fieldTextInput(id, label, note, value)` helper.
+  16.2  A whole new "RAG memory" block after the versioning toggle:
+        - heading `<h3 class="config-section-heading">RAG memory</h3>`;
+        - toggle `rag-commit-save` ("Commit saved chats to memory by
+          default", value settings.rag.commitOnSave) via new
+          `fieldToggle(id, label, note, value)` helper;
+        - toggle `rag-auto-ingest` ("Auto-load transcripts when the
+          memory store is empty", default true when unset).
+  16.3  `buildRagStoreManager()` renders the store status line
+        (`RAG store: <path> — N segment(s) indexed.`) plus two buttons -
+        "Forget everything" (confirm -> `resetRag()`, then refresh) and
+        "Rebuild memory" (`rebuildRag()`, then refresh). It imports the
+        api calls dynamically and never blocks the form's own save flow.
+  16.4  `values()` now includes:
+            dataDir:  byId("data-dir-path").value.trim(),
+            ragDbPath: byId("rag-db-path").value.trim(),
+            rag: {
+                commitOnSave: byId("rag-commit-save").checked,
+                autoIngest:   byId("rag-auto-ingest").checked,
+            },
+
+=================================================================
+ 17. FILE: static/css/styles.css              (CHANGED - THIS ROUND)
+=================================================================
+New `.cw-header-toggle` styles after the `.cw-agent-select` block: a
+flex pill (`border: 1px solid rgba(255,255,255,.35)`, translucent white
+background, white text) containing the checkbox (`accent-color:
+var(--color-accent, #6ea8fe)`) and a `.cw-header-toggle-label` span.
+All other widget CSS is byte-for-byte unchanged.
+
+=================================================================
+ 18. FILE: README.md                          (CHANGED - THIS ROUND)
+=================================================================
+  18.1  API table rows updated/added:
+        - `POST /api/chat` column now shows the optional `rag?` field.
+        - `POST /api/chats/end` row notes the `rag` override.
+        - three new rows: GET /api/rag/status, POST /api/rag/rebuild,
+          POST /api/rag/reset.
+  18.2  New "### RAG memory store" section after the API table describing
+        the per-chat toggle, `rag.commitOnSave` default, `rag.autoIngest`
+        self-heal gate, the configurable paths (resolved by app/paths.py,
+        applied on restart), the CLI/manual maintenance, and that the
+        store keeps its embeddings even if transcripts are deleted.
+
+=================================================================
+ 19. FILE: documentation/CREATING_AGENTS.md   (CHANGED - THIS ROUND)
+=================================================================
+The `search_chat_logs` tools row was reworded to describe the
+configurable store location (`data/rag_db` default), the autoIngest-gated
+self-heal, and the management entry points (Configuration -> RAG memory or
+`scripts/rebuild_rag.py build|purge|status`).
+
+=================================================================
+ 20. FILE: documentation/_make_snapshot.py    (CHANGED - THIS ROUND)
+=================================================================
+  20.1  FILES manifest - additions (all asserted to exist):
+        - after "app/tools/web.py":
+              "app/paths.py",
+              "app/rag_commit.py",
+              "rag/ingest.py",
+              "rag/search.py",
+              "rag/main.py",
+        - after "agent_library/problem_discovery_agent/agent.md":
+              "agent_library/rag_assistant/agent.json",
+              "agent_library/rag_assistant/agent.md",
+        - after "scripts/version_chats.py":
+              "scripts/rebuild_rag.py",
+        Total embedded files: 44 -> 52.
+  20.2  CHANGELOGS now archives every delta version including v1-7 and
+        this v1-8 file (8 entries).
+  20.3  TREE (Section 1) rewrite:
+        - `app/` gains the `paths.py` + `rag_commit.py` rows;
+        - new top-level `rag/` branch (ingest.py, search.py, main.py);
+        - `agent_library/` gains `rag_assistant/`;
+        - `scripts/` gains `rebuild_rag.py`;
+        - `documentation/` rows now list v1-7 and v1-8.
+  20.4  DOCSCRIPT_PROMPT refresh: changelog list now runs to v1-8; the
+        next-delta example file becomes `the_entire_enchilada_v1-9.txt`;
+        the "Excluded" note already covers `data/`.
+
+=================================================================
+ 21. FILE: documentation/APP_SNAPSHOT.md         (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits):
+  - Section 2 now embeds 52 files (ADDED: app/paths.py,
+    app/rag_commit.py, rag/ingest.py, rag/search.py, rag/main.py,
+    agent_library/rag_assistant/agent.json + agent.md,
+    scripts/rebuild_rag.py).
+  - Section 3 archive now contains 8 changelogs (v1-1 .. v1-8).
+  - Section 1 tree updated as in 20.3; Section 4 docscript updated as in
+    20.4.
+
+=================================================================
+ 22. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `python -m py_compile` over every changed backend module
+     (server.py, app/paths.py, app/rag_commit.py, app/chat_store/store.py,
+     app/chat_store/logger.py, app/tools/search.py, scripts/rebuild_rag.py,
+     rag/{main,ingest,search}.py) - all compile.
+   - `python scripts/rebuild_rag.py status` shows resolved paths + chunk
+     count; `python scripts/rebuild_rag.py build` re-indexes whatever
+     transcripts exist (0 after the source files were removed, so the
+     store's 36 already-indexed segments are preserved either way). The
+     full purge -> build round-trip was exercised in the earlier session
+     that introduced the store.
+   - `from app.tools.search import search_chat_logs; search_chat_logs(...)`
+     returns recall matches from the live store.
+   - `node --check` passes for every changed JS file (app.js,
+     chat-window.js, config-form.js, api.js).
+   - `resolve_path` regression check: `paths.CHAT_RECORDS_DIR` honours
+     `chatSavePath: "E:\\saved from app"` after the `_rooted` fix.
+   - Full store round-trip (commit -> status -> restore) leaves the store
+     at its original 36 indexed segments; real store is untouched.
+   - `python documentation/_make_snapshot.py` ran clean and regenerated
+     APP_SNAPSHOT.md.
+
+=================================================================
+ 23. FILES NOT CHANGED (confirmed byte-for-byte this round)
+=================================================================
+   - app/core/agent.py, app/core/llm.py, app/core/prompt.py
+   - app/agents/loader.py, app/agents/registry.py, app/agents/factory.py
+   - app/tools/registry.py, app/tools/files.py, app/tools/workspace.py,
+     app/tools/datetime_tools.py, app/tools/web.py
+   - app/chat_store/__init__.py
+   - agent_library/basic_chat/*, agent_library/dev_assistant/*,
+     agent_library/problem_discovery_agent/*
+   - config/models.json, config/settings.json
+   - static/index.html, static/chat.html
+   - static/config/app_settings.json (no `rag` key written yet; the new
+     keys appear only after the user saves the updated form)
+   - static/js/classes/ChatSession.js, static/js/logic/models.js,
+     static/js/logic/chat-formatter.js, static/js/ui/markdown.js,
+     static/js/ui/agents.js, static/js/ui/config.js,
+     static/js/ui/appearance.js, static/js/ui/chat-tests.js
+   - scripts/version_chats.py, requirements.txt
+   - rag/test_app.py (dev scratch harness; excluded from the snapshot)
+   - the_entire_enchilada.txt and v1.txt .. v1-7.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 24. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-8.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-7.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (notably everything
+   under `static/js/`, `static/css/`, `static/`, and the backend under
+   `app/` and `rag/`) against the versions/descriptions captured in
+   `the_entire_enchilada_v1-8.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-9.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).

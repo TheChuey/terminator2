@@ -1,0 +1,55 @@
+{
+  "defaultAgentId": "dev_assistant",
+  "defaultModel": "gemma4:e2b",
+  "activeDiscussionId": "disc-mthko2ytzf9exz",
+  "disableVersioning": false,
+  "behavior": {
+    "autoHi": true
+  },
+  "appearance": {
+    "theme": "dark",
+    "fontFamily": "",
+    "fontSize": 16
+  },
+  "chatTests": {
+    "enabled": true,
+    "tests": [
+      {
+        "id": "custom-mtnwyh6t-krgy",
+        "name": "what is you objective",
+        "agentId": "dev_assistant",
+        "steps": [
+          "what is you objective",
+          "who is the user",
+          "list all the cities in california"
+        ],
+        "expectedResult": {
+          "mode": "type",
+          "value": "nonEmpty"
+        },
+        "enabled": true
+      },
+      {
+        "id": "custom-mtpctkwi-7lgm",
+        "name": "name species of cats",
+        "agentId": "rag_assistant",
+        "steps": [
+          "name species of cats",
+          "how many presidetns of the usa are there",
+          "who is the user"
+        ],
+        "expectedResult": {
+          "mode": "type",
+          "value": "nonEmpty"
+        },
+        "enabled": true
+      }
+    ]
+  },
+  "dataDir": "E:\\data\\rag_store",
+  "ragDbPath": "E:\\data\\db",
+  "rag": {
+    "commitOnSave": false,
+    "autoIngest": true
+  }
+}
