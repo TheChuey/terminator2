@@ -48,11 +48,8 @@ short_circuit_1/
 │   │
 │   └── tools/
 │       ├── registry.py        # TOOL_REGISTRY: tool IDs -> Python functions
-│       ├── files.py           # read_file, write_file, read_pdf
-│       ├── workspace.py       # create_folder, create_file, setup_venv
-│       ├── datetime_tools.py  # get_current_date, tell_me_the_date_and_time
-│       ├── search.py          # (future search tools)
-│       └── web.py             # (future web tools)
+│       ├── state.py           # FileSession: shared file-working state for agents
+│       └── tools.py           # the 7 tools: map/read/write/delete + date/time + search
 │
 ├── agent_library/             # THE AGENTS - filesystem is the source of truth
 │   ├── basic_chat/            # agent.md + agent.json  (mode: chat, no tools)
@@ -163,12 +160,14 @@ Saved chats can be committed to a persistent RAG store so agents using the
   Transcripts follow **Chat save path**, not the Data folder; blank means
   `<dataDir>/chatlog/agent-text-records`.
 - **Manual maintenance:** `python scripts/rebuild_rag.py
-  [build|purge|status]` or the "Rebuild memory"/"Forget everything" buttons
-  in Configuration.
+  [build|purge|status]`, the "Rebuild memory"/"Forget everything" buttons
+  in Configuration, or the "Clear Memory" button in the chat header
+  (`static/chat.html`) — clear resets the store to zero entries.
 
 The store lives at `data/rag_db/chroma.sqlite3` by default. The store keeps
 embeddings even if the original transcripts are deleted, so recall keeps
-working until you run "Forget everything".
+working until you wipe it ("Forget everything" in Configuration, or "Clear
+Memory" in the chat header).
 
 ## Creating a new agent
 
@@ -182,9 +181,8 @@ Full field reference, tool catalog, copy-paste example, and troubleshooting:
 
 ## Adding a new tool
 
-1. Write the function in the right category module (`app/tools/files.py`,
-   `workspace.py`, ...) with a clear docstring — Ollama turns docstrings
-   into the tool schema the LLM sees.
+1. Write the function in `app/tools/tools.py` with a clear docstring —
+   Ollama turns docstrings into the tool schema the LLM sees.
 2. Add one line to `TOOL_REGISTRY` in `app/tools/registry.py`.
 3. Reference the ID in any agent's `agent.json`.
 

@@ -45,7 +45,7 @@ and definitions are re-read for every message. Edits apply immediately.
   "description": "Researches topics using web tools.",
   "mode": "agent",
   "model": null,
-  "tools": ["read_file", "write_file"]
+  "tools": ["read_file", "write_text_file"]
 }
 ```
 
@@ -108,15 +108,13 @@ IDs you can put in `"tools"` today:
 
 | ID | Category | Description |
 |---|---|---|
-| `read_file` | files.py | Reads and returns the contents of a text file. |
-| `write_file` | files.py | Writes or overwrites text content to a file. |
-| `read_pdf` | files.py | Extracts text contents from a PDF file. |
-| `create_folder` | workspace.py | Creates a directory at the specified path. |
-| `create_file` | workspace.py | Creates a new file with optional initial content. |
-| `setup_venv` | workspace.py | Creates a Python virtual environment (.venv). |
-| `get_current_date` | datetime_tools.py | Returns the real current date as a formatted string. |
-| `tell_me_the_date_and_time` | datetime_tools.py | Returns the current date and time. |
-| `search_chat_logs` | search.py | Searches past chat transcripts via the local RAG store (default `data/rag_db`, configurable from the UI). When it finds an empty store it self-heals by indexing every transcript once (`data/chatlog/agent-text-records/` by default) — only if "Auto-load transcripts" (`rag.autoIngest`) is on. Stores are rebuilt/cleared from Configuration → RAG memory or `scripts/rebuild_rag.py build\|purge\|status`. |
+| `map_files` | tools.py | Inspects a directory and returns a structured list of files/folders (to a depth). |
+| `read_file` | tools.py | Reads any file via IBM Docling and returns well-formatted markdown text (PDF/DOCX/PPTX/XLSX/HTML/images + plain text/code; OCR on by default). |
+| `write_text_file` | tools.py | Creates a text file (mkdir -p's the folder; overwrite=False by default). |
+| `delete_files` | tools.py | Deletes files only after explicit `approved=True` (two-step confirmation). |
+| `get_current_date` | tools.py | Returns the real current date. |
+| `tell_me_the_date_and_time` | tools.py | Returns the current date and time. |
+| `search_chat_logs` | tools.py | Searches past chat transcripts via the local RAG store (default `data/rag_db`, configurable from the UI). When it finds an empty store it self-heals by indexing every transcript once (`data/chatlog/agent-text-records/` by default) — only if "Auto-load transcripts" (`rag.autoIngest`) is on. Stores are rebuilt/cleared from Configuration → RAG memory or `scripts/rebuild_rag.py build\|purge\|status`. |
 
 Missing IDs produce a loud warning in the server console and are skipped:
 
@@ -124,7 +122,7 @@ Missing IDs produce a loud warning in the server console and are skipped:
 [TOOLS] WARNING: tool 'web_search' is listed in agent.json but missing from TOOL_REGISTRY - skipped
 ```
 
-To add a new tool: write the function in the right module under `app/tools/`
+To add a new tool: write the function in `app/tools/tools.py`
 with a clear docstring (Ollama turns docstrings into the schema the LLM
 sees), then add one line to `TOOL_REGISTRY` in `app/tools/registry.py`.
 
@@ -143,7 +141,7 @@ Create these two files, refresh the browser, done.
   "description": "Researches topics using local files and organized notes.",
   "mode": "agent",
   "model": null,
-  "tools": ["read_file", "write_file", "get_current_date"]
+  "tools": ["read_file", "write_text_file", "get_current_date"]
 }
 ```
 

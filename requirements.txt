@@ -1,6 +1,7 @@
 # requirements.txt - Declares dependencies for the Stateful Agentic RAG Module
 # Designed to run locally on your Linux environment
 chromadb>=0.4.0
+docling>=2.59.0
 ollama>=0.3.0
 pydantic>=2.0.0
 

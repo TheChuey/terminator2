@@ -3,7 +3,7 @@ Complete self-contained copy of the application as of last update.
 
 - **Section 1** — file structure
 - **Section 2** — folder + file name + full contents of every file
-- **Section 3** — change-log archive (the_entire_enchilada v1-1 .. v1-9)
+- **Section 3** — change-log archive (the_entire_enchilada v1-1 .. v1-11)
 - **Section 4** — endpoint definitions, variables, and an AI PROMPT with step-by-step instructions for replicating the application
 
 ---
@@ -27,11 +27,8 @@ terminator1/  (Terminator1)
 │   │
 │   ├── tools/
 │   │   ├── registry.py        # TOOL_REGISTRY: tool IDs -> Python functions
-│   │   ├── files.py           # read_file, write_file, read_pdf
-│   │   ├── workspace.py       # create_folder, create_file, setup_venv
-│   │   ├── datetime_tools.py  # get_current_date, tell_me_the_date_and_time
-│   │   ├── search.py          # (future search tools)
-│   │   └── web.py             # (future web tools)
+│   │   ├── state.py           # FileSession: shared file-working state for agents
+│   │   └── tools.py           # the 7 tools: map/read/write/delete + date/time + search
 │   │
 │   └── chat_store/            # chat log ownsership (one active chat, JSONL records)
 │       ├── __init__.py        # package marker
@@ -87,8 +84,9 @@ terminator1/  (Terminator1)
 │   ├── the_entire_enchilada_v1-5.txt     # NET-DELTA log (V1.4 -> V1.5)
 │   ├── the_entire_enchilada_v1-6.txt     # NET-DELTA log (V1.5 -> V1.6)
 │   ├── the_entire_enchilada_v1-7.txt     # NET-DELTA log (V1.6 -> V1.7)
-│   ├── the_entire_enchilada_v1-8.txt     # NET-DELTA log (V1.7 -> V1.8)
-│   └── the_entire_enchilada_v1-9.txt     # NET-DELTA log (V1.8 -> V1.9)
+│   ├── the_entire_enchilada_v1-9.txt     # NET-DELTA log (V1.8 -> V1.9)
+│   └── the_entire_enchilada_v1-10.txt    # NET-DELTA log (V1.9 -> V1.10)
+│   └── the_entire_enchilada_v1-11.txt    # NET-DELTA log (V1.10 -> V1.11)
 │
 ├── README.md                  # architecture map + quickstart
 ├── requirements.txt           # pinned dependencies
@@ -640,12 +638,14 @@ The Agent does not know what KIND of agent it is (research, coding, chat...).
 Its behavior comes entirely from its AgentProfile and the tools it was given.
 """
 
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Callable, List
 
 from app.core.llm import ask_llm
+from app.tools.state import FileSession
 
 
 # ==========================================================================
@@ -701,20 +701,26 @@ class Agent:
     """A generic AI agent that can think (ask the LLM), act (call a tool) and
     observe (record the tool's result back into the conversation)."""
 
-    def __init__(self, model: str | None, tools: List[Callable], profile: AgentProfile):
-        """Store the model, tools, and profile to use during conversations."""
+    def __init__(self, model: str | None, tools: List[Callable], profile: AgentProfile, session: FileSession | None = None):
+        """Store the model, tools, profile, and optional FileSession."""
         self.model = model
         self.profile = profile
         self.tools = {f.__name__: f for f in tools}
         self.messages: List[dict] = []
+        self.session = session or FileSession()
 
     def _extract_text_tool_calls(self, content: str) -> List[dict]:
         """Find tool calls that a model wrote as plain-text JSON instead of using
         Ollama's native tool_calls field (a common quirk of small local models).
 
-        Accepts bare JSON, ```json fenced blocks, or a JSON object embedded in
-        prose. ONLY names present in self.tools are returned, so ordinary replies
-        that happen to contain JSON are never executed.
+        Accepts bare JSON, ```json fenced blocks, a JSON object or ARRAY of
+        objects embedded in prose, and objects wrapped under keys like
+        "tool_calls" / "calls" / "functions". ONLY names present in self.tools
+        are returned, and only when the call's required arguments are present
+        (so prose that merely mention a tool is never executed).
+
+        Tool-call objects may use "arguments", "args" OR "parameters" as the
+        arguments key (small models differ).
         """
         text = (content or "").strip()
         if text.startswith("```"):  # unwrap markdown code fences
@@ -725,8 +731,30 @@ class Agent:
 
         candidates: List[dict] = []
         try:
-            candidates.append(json.loads(text))
+            parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError):
+            parsed = None
+
+        if parsed is not None:
+            # Top-level array of calls, object wrapped around a list of calls,
+            # or a single call object.
+            if isinstance(parsed, list):
+                candidates.extend(parsed)
+            elif isinstance(parsed, dict):
+                found = False
+                for wrap_key in ("tool_calls", "calls", "functions", "call"):
+                    wrapped = parsed.get(wrap_key)
+                    if isinstance(wrapped, list):
+                        candidates.extend(wrapped)
+                        found = True
+                        break
+                    if isinstance(wrapped, dict):
+                        candidates.append(wrapped)
+                        found = True
+                        break
+                if not found:
+                    candidates.append(parsed)
+        else:
             # one nesting level allowed so nested "arguments" objects are captured
             for match in re.finditer(r"\{(?:[^{}]|\{[^{}]*\})*\}", content or ""):
                 try:
@@ -738,21 +766,135 @@ class Agent:
         for item in candidates:
             if not isinstance(item, dict) or item.get("name") not in self.tools:
                 continue
-            args = item.get("arguments", {}) or {}
-            if isinstance(args, str):  # some models send arguments as a JSON string
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            if not isinstance(args, dict):
-                args = {}
+            # Accept "arguments", "args", or "parameters" as the args key.
+            args = item.get("arguments", item.get("args", item.get("parameters", {}))) or {}
+            args = self._normalize_args(item["name"], args)
+            if not self._has_required_args(item["name"], args):
+                continue
             calls.append({"function": {"name": item["name"], "arguments": args}})
         return calls
+
+    def _has_required_args(self, name: str, args: dict) -> bool:
+        """True when every required (no-default) parameter of the tool is present
+        in args. Prevents executing narration that merely mentions a tool."""
+        fn = self.tools.get(name)
+        if fn is None:
+            return False
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return True
+        required = {
+            p.name for p in sig.parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return required.issubset(args.keys())
+
+    def _normalize_args(self, name: str, args) -> dict:
+        """Coerce the many different argument shapes small local models send for
+        tool calls into a clean dict of keyword args the tool actually accepts.
+
+        Handles:
+            - args as a JSON string: '{"path": "..."}'
+            - single-key wrappers:   {"args": {...}}, {"arguments": {...}}
+            - positional list:       ["E:\\..."], [name, content, path]
+            - string booleans:       {"overwrite": "false"} -> False
+            - anything non-dict:     gracefully -> {}
+        """
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+
+        if isinstance(args, dict) and len(args) == 1:
+            if "args" in args:
+                args = args["args"]
+            elif "arguments" in args:
+                args = args["arguments"]
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    return {}
+
+        if isinstance(args, list):
+            fn = self.tools.get(name)
+            if fn is not None:
+                try:
+                    params = [
+                        p for p in inspect.signature(fn).parameters.values()
+                        if p.kind in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    ]
+                    bound = {}
+                    for param, value in zip(params, args):
+                        if param.name not in bound:
+                            bound[param.name] = value
+                    return self._coerce_bools(bound, {p.name for p in params if p.annotation is bool})
+                except (TypeError, ValueError):
+                    pass
+            return {}
+
+        if not isinstance(args, dict):
+            return {}
+
+        # Drop any keys that aren't actual parameters of the tool, so stray
+        # keys the model invents (e.g. "path" on a no-arg tool) never crash
+        # the call. Tools exposing **kwargs keep everything.
+        bool_params = set()
+        fn = self.tools.get(name)
+        if fn is not None:
+            try:
+                sig = inspect.signature(fn)
+                if not any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                ):
+                    valid = {p.name for p in sig.parameters.values() if p.kind in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )}
+                    args = {k: v for k, v in args.items() if k in valid}
+                bool_params = {
+                    p.name for p in sig.parameters.values() if p.annotation is bool
+                }
+            except (TypeError, ValueError):
+                pass
+
+        return self._coerce_bools(args, bool_params)
+
+    @staticmethod
+    def _coerce_bools(args: dict, bool_params: set) -> dict:
+        """Turn string 'true'/'false'/'1'/'0' into real bools, but ONLY for
+        parameters that are actually typed as bool (so a string param like
+        name="yes" is never mangled)."""
+        coerced = dict(args)
+        for key, value in list(coerced.items()):
+            if (
+                key in bool_params
+                and isinstance(value, str)
+                and value.strip().lower() in ("true", "false", "yes", "no", "1", "0")
+            ):
+                coerced[key] = value.strip().lower() in ("true", "yes", "1")
+        return coerced
+
+    MAX_TOOL_ROUNDS = 6
 
     def think(self, user_input: str) -> str:
         """Add user input to history, send the conversation to the LLM, and return its reply."""
         if not self.messages or self.messages[0].get("role") != "system":
             self.messages.insert(0, {"role": "system", "content": self.profile.system_prompt})
+
+        self._inject_session_context()
 
         self.messages.append({"role": "user", "content": user_input})
 
@@ -763,23 +905,61 @@ class Agent:
 
         # Native tool_calls, or calls the model wrote as plain-text JSON.
         # Both paths flow through act()/observe() and a follow-up LLM round.
+        # Keep looping while the model keeps issuing tool calls, so a chain of
+        # tool calls always ends in a real text reply (never a silent "").
         tool_calls = message.get("tool_calls") or self._extract_text_tool_calls(message.get("content", ""))
-        if tool_calls:
+        for _ in range(self.MAX_TOOL_ROUNDS):
+            if not tool_calls:
+                break
             origin = "native tool_calls" if message.get("tool_calls") else "TEXT reply"
             print(f"[Agent.think] Executing {len(tool_calls)} tool call(s) from {origin}.")
             for tool_call in tool_calls:
                 result = self.act(tool_call)
                 self.observe(tool_call["function"]["name"], result)
 
+            self._inject_session_context()
+
             message = ask_llm(messages=self.messages, model=self.model, tools=tool_callables)
             self.messages.append(message)
+            tool_calls = message.get("tool_calls") or self._extract_text_tool_calls(message.get("content", ""))
 
-        return message.get("content", "")
+        content = message.get("content", "") or ""
+        if not content.strip():
+            print(f"[Agent.think] No text reply after {self.MAX_TOOL_ROUNDS} tool round(s); returning fallback.")
+            return "(I ran my tools but did not produce a final answer. Please ask again.)"
+        return content
+
+    _SESSION_CONTEXT_ROLE = "system"
+    _SESSION_CONTEXT_PREFIX = "CURRENT FILE SESSION STATE"
+
+    def _inject_session_context(self) -> None:
+        """Add current FileSession state as context for the model, replacing any
+        previously injected block so history doesn't grow duplicate state."""
+        if not self.session:
+            return
+        state = self.session.get_state()
+        if not any(state.values()):
+            return
+        context_entries = []
+        for key, value in state.items():
+            if value:
+                context_entries.append(f"  {key}: {value}")
+        context = f"{self._SESSION_CONTEXT_PREFIX} (from previous tool calls):\n" + "\n".join(context_entries)
+
+        # Replace any earlier context block instead of appending another one.
+        for i, message in enumerate(self.messages):
+            if (
+                message.get("role") == self._SESSION_CONTEXT_ROLE
+                and str(message.get("content", "")).startswith(self._SESSION_CONTEXT_PREFIX)
+            ):
+                self.messages[i]["content"] = context
+                return
+        self.messages.append({"role": self._SESSION_CONTEXT_ROLE, "content": context})
 
     def act(self, tool_call: dict) -> str:
         """Run one tool that the LLM asked for, using the name and args it chose."""
         name = tool_call.get("function", {}).get("name")
-        args = tool_call.get("function", {}).get("arguments", {})
+        args = self._normalize_args(name, tool_call.get("function", {}).get("arguments", {}))
         if name in self.tools:
             try:
                 result = str(self.tools[name](**args))
@@ -1292,7 +1472,101 @@ from typing import Callable
 from app.agents.loader import load_definition, AgentNotFoundError
 from app.core.agent import Agent
 from app.core.prompt import PromptManager
-from app.tools.registry import resolve_tools
+from app.tools.registry import resolve_tools, get_session
+
+
+def _session_aware(func: Callable, session) -> Callable:
+    """Wrap a tool so its results are recorded into the shared FileSession.
+
+    Uses functools.wraps so inspect.signature() (and therefore the schema
+    Ollama builds for tool calling) sees the REAL tool signature, not the
+    wrapper's (*args, **kwargs).
+
+    Standard tool response shape: {"success", "tool", "data": {...}, "error"}.
+    Known data keys are translated into session state:
+        files                   -> add_discovered(paths)
+        path / path+content     -> record_read(...)
+        filename/path (written) -> add_output(path)
+        pending_files (delete)  -> mark_for_deletion(paths)
+
+    Safety gate: delete_files(approved=True) can only delete paths that were
+    previously PROPOSED (approved=False) and recorded in session.pending_deletion.
+    Any path the model fabricates or invents is rejected instead of deleted.
+    """
+    import functools
+    import inspect as _inspect
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if func.__name__ == "delete_files" and session is not None:
+            bound, approved, file_list = _bind_delete_args(func, args, kwargs)
+            if approved and file_list:
+                pending = list(session.pending_deletion or [])
+                proposed = [f for f in file_list if f in pending]
+                rejected = [f for f in file_list if f not in pending]
+                if not proposed:
+                    return {
+                        "success": False,
+                        "tool": "delete_files",
+                        "data": {},
+                        "error": (
+                            "Deletion blocked: none of these paths were previously "
+                            "proposed for deletion. Run delete_files with "
+                            "approved=False first."
+                        ),
+                    }
+                bound.arguments["file_list"] = proposed
+                try:
+                    result = func(*bound.args, **bound.kwargs)
+                except TypeError:
+                    result = None
+                if isinstance(result, dict):
+                    data = result.get("data") or {}
+                    data["rejected"] = rejected
+                    if rejected and not result.get("error"):
+                        result["error"] = "Some paths were not previously proposed and were skipped."
+                    deleted = [k for k, v in data.get("results", {}).items() if v == "deleted"]
+                    if deleted:
+                        session.pending_deletion = [p for p in session.pending_deletion if p not in deleted]
+                return result
+
+        result = func(*args, **kwargs)
+        _record_result(result, session)
+        return result
+
+    # Belt-and-braces: even if a future consumer uses follow_wrapped=False,
+    # the wrapper advertises the real signature and annotations.
+    wrapper.__signature__ = _inspect.signature(func)
+    wrapper.__annotations__ = func.__annotations__
+    return wrapper
+
+
+def _bind_delete_args(func, args, kwargs):
+    """Bind delete_files(*args, **kwargs) into (BoundArguments, approved, file_list)."""
+    import inspect as _inspect
+    try:
+        bound = _inspect.signature(func).bind(*args, **kwargs)
+        bound.apply_defaults()
+    except TypeError:
+        return None, False, []
+    return bound, bool(bound.arguments.get("approved")), list(bound.arguments.get("file_list") or [])
+
+
+def _record_result(result, session) -> None:
+    """Translate a tool result dict into shared FileSession state."""
+    if not (isinstance(result, dict) and session is not None):
+        return
+    from app.tools.state import FileSession
+    data = result.get("data") or {}
+    if result.get("tool") == "map_files":
+        files = data.get("files") or []
+        session.add_discovered([f["path"] for f in files])
+    elif result.get("tool") == "read_file":
+        session.record_read(data.get("path", ""), data.get("extracted_content", ""))
+    elif result.get("tool") == "write_text_file" and data.get("path"):
+        session.add_output(data["path"])
+    elif result.get("tool") == "delete_files" and data.get("pending_files"):
+        session.mark_for_deletion(data["pending_files"])
 
 
 def build_agent(agent_id: str, model: str | None = None) -> Agent:
@@ -1316,7 +1590,9 @@ def build_agent(agent_id: str, model: str | None = None) -> Agent:
     profile = PromptManager.build(definition, tools)
 
     resolved_model = model or meta.get("model") or None
-    return Agent(model=resolved_model, tools=tools, profile=profile)
+    session = get_session()
+    tools = [_session_aware(fn, session) for fn in tools]
+    return Agent(model=resolved_model, tools=tools, profile=profile, session=session)
 
 
 def replay_history(agent: Agent, history: list[dict] | None) -> None:
@@ -1342,195 +1618,570 @@ FILE: registry.py
 app/tools/registry.py
 =====================
 
-The single mapping between tool IDs (used in agent.json) and the actual
-Python functions the Agent can call.
+Central tool registry. Maps tool IDs (strings used in agent.json) to Python
+callables. Agents declare which tools they need by ID; the factory resolves
+those IDs here into actual functions.
+
+All tool implementations live in app/tools/tools.py; their docstrings are
+the schema the LLM sees. This module only wires them to their public IDs.
+
+Adding a new tool:
+    1. Write the function in app/tools/tools.py (with a clear docstring)
+    2. Import it below and add it to _TOOL_REGISTRY with its string ID
 """
 
-from app.tools.files import read_file, read_pdf, write_file
-from app.tools.workspace import create_file, create_folder, setup_venv
-from app.tools.datetime_tools import get_current_date, tell_me_the_date_and_time
-from app.tools.search import search_chat_logs
+from typing import Callable
 
-TOOL_REGISTRY = {
-    # files
+from app.tools.tools import (
+    map_files,
+    read_file,
+    write_text_file,
+    delete_files,
+    get_current_date,
+    tell_me_the_date_and_time,
+    search_chat_logs,
+)
+from app.tools.state import FileSession
+
+# ---------------------------------------------------------------------------
+# Canonical registry  –  tool_id -> callable
+# ---------------------------------------------------------------------------
+_TOOL_REGISTRY: dict[str, Callable] = {
+    # File management
+    "map_files": map_files,
     "read_file": read_file,
-    "write_file": write_file,
-    "read_pdf": read_pdf,
+    "write_text_file": write_text_file,
+    "delete_files": delete_files,
 
-    # workspace
-    "create_folder": create_folder,
-    "create_file": create_file,
-    "setup_venv": setup_venv,
-
-    # datetime
+    # Date/time
     "get_current_date": get_current_date,
     "tell_me_the_date_and_time": tell_me_the_date_and_time,
 
-    # search
+    # RAG / search
     "search_chat_logs": search_chat_logs,
 }
 
+# Shared session instance (created once, shared across agents in a process)
+_session = FileSession()
 
-def resolve_tools(tool_ids: list[str]) -> list:
-    """Map tool IDs to functions, reporting missing IDs loudly instead of
-    dropping them silently."""
-    resolved = []
-    for tool_id in tool_ids:
-        if tool_id in TOOL_REGISTRY:
-            resolved.append(TOOL_REGISTRY[tool_id])
-        else:
-            print(f"[TOOLS] WARNING: tool '{tool_id}' is listed in agent.json but missing from TOOL_REGISTRY - skipped")
-    return resolved
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get(tool_name: str) -> Callable | None:
+    """Retrieve an executable tool by its registered name."""
+    return _TOOL_REGISTRY.get(tool_name)
+
+
+def list_tools() -> list[str]:
+    """Returns a list of all registered tool names."""
+    return list(_TOOL_REGISTRY.keys())
 
 
 def available_tool_ids() -> list[str]:
-    """All registered tool IDs (useful for debugging / future endpoints)."""
-    return sorted(TOOL_REGISTRY.keys())
+    """Backward-compatible alias for list_tools()."""
+    return list_tools()
+
+
+def resolve_tools(tool_ids: list[str]) -> list[Callable]:
+    """Map a list of tool ID strings to their callable functions.
+
+    Unknown IDs are silently skipped (with a warning) so that agent
+    definitions can reference tools that may not be installed.
+    """
+    resolved = []
+    for tid in tool_ids:
+        fn = _TOOL_REGISTRY.get(tid)
+        if fn is not None:
+            resolved.append(fn)
+        else:
+            print(f"[registry] WARNING: tool '{tid}' not found – skipped.")
+    return resolved
+
+
+def get_session() -> FileSession:
+    """Return the shared FileSession instance."""
+    return _session
 ````
 
 ============================================================
 FOLDER: app/tools
-FILE: files.py
+FILE: state.py
 ============================================================
 
 ````python
 """
-app/tools/files.py
+app/tools/state.py
 ==================
 
-File tools: reading and writing text files and extracting PDF text.
+Shared working state for the file-management tools.
 
-Docstrings matter: Ollama turns each tool's docstring into the schema the
-LLM sees when deciding which tool to call.
+The FileSession is the single in-memory record of everything a file-aware
+agent has discovered, read, written, or proposed for deletion during the
+current process. It lets later tool calls (and the model itself) build on
+previous results instead of re-scanning the filesystem each turn.
+
+The session is process-wide: one instance is created lazily and shared by
+every agent that is built in this process.
+
+It is injected into the conversation by Agent._inject_session_context and
+hydrated from tool results by the _record_result wrapper in app/agents/factory.py.
 """
 
-import os
 
-try:
-    from pypdf import PdfReader
-except ImportError:
-    PdfReader = None
+class FileSession:
+    """Manages file-management working state for AI agents dynamically.
 
+    Tracks, across tool calls in one process:
 
-def read_file(file_path: str) -> str:
-    """Reads and returns the contents of a text file."""
-    if not os.path.exists(file_path):
-        return f"Error: File '{file_path}' does not exist."
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+        discovered_files   - paths surfaced by map_files / other listing tools
+        selected_files     - paths the agent has explicitly chosen to work on
+        read_files         - paths whose contents have already been read
+        working_content    - path -> last extracted text content (read_file)
+        output_files       - paths the agent has written (write_text_file)
+        pending_deletion   - paths proposed for deletion but not yet approved
+    """
 
+    def __init__(self):
+        self.discovered_files = []
+        self.selected_files = []
+        self.read_files = []
+        self.working_content = {}
+        self.output_files = []
+        self.pending_deletion = []
 
-def write_file(file_path: str, content: str) -> str:
-    """Writes or overwrites text content to a file."""
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"Content successfully written to: {file_path}"
+    def add_discovered(self, paths: list):
+        """Record files/directories surfaced by map_files (deduplicated)."""
+        self.discovered_files = list(set(self.discovered_files + paths))
 
+    def select_files(self, paths: list):
+        """Mark paths as the agent's active working set (deduplicated)."""
+        self.selected_files = list(set(self.selected_files + paths))
 
-def read_pdf(pdf_path: str) -> str:
-    """Extracts text contents from a PDF file."""
-    if not PdfReader:
-        return "Error: pypdf is not installed. Install via `pip install pypdf`."
-    if not os.path.exists(pdf_path):
-        return f"Error: PDF '{pdf_path}' does not exist."
+    def record_read(self, path: str, content: str):
+        """Remember that a path was read and cache its extracted content."""
+        if path not in self.read_files:
+            self.read_files.append(path)
+        self.working_content[path] = content
 
-    reader = PdfReader(pdf_path)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+    def add_output(self, path: str):
+        """Remember a path produced by the write tool (deduplicated)."""
+        if path not in self.output_files:
+            self.output_files.append(path)
+
+    def mark_for_deletion(self, paths: list):
+        """Propose paths for deletion (deduplicated; approval happens later)."""
+        self.pending_deletion = list(set(self.pending_deletion + paths))
+
+    def get_state(self) -> dict:
+        """Snapshot the current session state for injection into the prompt."""
+        return {
+            "discovered_files": self.discovered_files,
+            "selected_files": self.selected_files,
+            "read_files": self.read_files,
+            "output_files": self.output_files,
+            "pending_deletion": self.pending_deletion
+        }
 ````
 
 ============================================================
 FOLDER: app/tools
-FILE: workspace.py
+FILE: tools.py
 ============================================================
 
 ````python
 """
-app/tools/workspace.py
-======================
+app/tools/tools.py
+==================
 
-Workspace tools: creating folders, files, and Python virtual environments.
+Every executable tool in the application, consolidated into one module.
+
+One function per tool; each function's docstring is what the LLM "sees":
+PromptManager turns the first line into the system prompt's AVAILABLE TOOLS
+section, and Ollama derives the JSON tool schema from the function name,
+signature, types, and docstring. Keep them precise and self-describing.
+
+Registered tools (IDs in agent.json):
+    map_files, read_file, write_text_file, delete_files,
+    get_current_date, tell_me_the_date_and_time, search_chat_logs
+
+The shared FileSession lives in app/tools/state.py.
 """
 
 import os
-import subprocess
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# READ - Docling-powered document reader (IBM Docling)
+# ---------------------------------------------------------------------------
+
+# Plain-text formats are read straight off disk (fast path). Everything else
+# (PDF/DOCX/PPTX/XLSX/HTML/images/...) goes through IBM Docling's pipeline,
+# which returns clean, structurally-formatted markdown.
+_PLAIN_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".log", ".text",
+    ".csv", ".tsv",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx",
+    ".css", ".scss", ".sass", ".xml", ".tex", ".rst",
+}
 
 
-def create_folder(folder_path: str) -> str:
-    """Creates a directory at the specified path."""
-    os.makedirs(folder_path, exist_ok=True)
-    return f"Folder successfully created at: {folder_path}"
+def _is_plain_text(path: Path) -> bool:
+    """True for files whose raw text is already the well-formatted content."""
+    return path.suffix.lower() in _PLAIN_TEXT_EXTENSIONS
 
 
-def create_file(file_path: str, content: str = "") -> str:
-    """Creates a new file with optional initial content."""
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"File successfully created at: {file_path}"
+_DOCLING_CONVERTERS = {}
 
 
-def setup_venv(env_dir: str = ".venv") -> str:
-    """Creates a Python virtual environment (.venv)."""
-    subprocess.run(["python", "-m", "venv", env_dir], check=True)
-    return f"Virtual environment created at: {env_dir}"
-````
+def _docling_converter(ocr: bool):
+    """Return a cached, lazily-created Docling DocumentConverter.
 
-============================================================
-FOLDER: app/tools
-FILE: datetime_tools.py
-============================================================
+    The converter is created once per ocr setting and reused across calls so
+    the (expensive) pipeline + model artifacts are initialized only once.
+    First-ever conversion downloads the layout/OCR models from HuggingFace.
+    """
+    if ocr not in _DOCLING_CONVERTERS:
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+        except ImportError:
+            _DOCLING_CONVERTERS[ocr] = None
+            return None
 
-````python
-"""
-app/tools/datetime_tools.py
-===========================
+        if ocr:
+            options = PdfPipelineOptions(do_ocr=True)
+            converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
+            )
+        else:
+            converter = DocumentConverter()
 
-Date and time tools.
-"""
+        _DOCLING_CONVERTERS[ocr] = converter
+    return _DOCLING_CONVERTERS[ocr]
 
-from datetime import datetime
 
+def read_file(path: str, ocr: bool = True) -> dict:
+    """Reads a file and returns its content as well-formatted text (markdown).
+
+    Use this tool whenever you need the contents of a document, source file,
+    or any file on disk. It returns the extracted content ready to use.
+
+    Plain text and code files (.txt, .md, .log, .json, source code, ...) are
+    read directly off disk. All other formats - PDF, DOCX, PPTX, XLSX, HTML,
+    images, and more - are converted by IBM Docling into clean, structured
+    markdown that preserves headings, tables, and layout. OCR is enabled by
+    default so scanned PDFs are handled too.
+
+    Args:
+        path (str): Absolute path to the file to read.
+        ocr (bool): When True (default), optical character recognition is
+            enabled for PDFs so scanned/rotated pages can be read.
+
+    Returns:
+        dict: {"success": bool, "tool": "read_file", "data": {...}, "error": str|None}
+            data keys: path, filename, file_type, extracted_content, status
+    """
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return {
+            "success": False,
+            "tool": "read_file",
+            "data": {},
+            "error": f"File '{path}' not found."
+        }
+
+    try:
+        if _is_plain_text(p):
+            content = p.read_text(encoding="utf-8", errors="replace")
+            status = "success"
+        else:
+            converter = _docling_converter(ocr)
+            if converter is None:
+                return {
+                    "success": False,
+                    "tool": "read_file",
+                    "data": {},
+                    "error": "Docling is not installed. Install it with `pip install docling` "
+                             "to read PDF/DOCX/PPTX/XLSX/HTML/image files.",
+                }
+
+            from docling.datamodel.base_models import ConversionStatus
+
+            result = converter.convert(str(p), max_num_pages=400)
+            if result.status is ConversionStatus.FAILURE:
+                errors = "; ".join(e.error_message for e in getattr(result, "errors", []))
+                return {
+                    "success": False,
+                    "tool": "read_file",
+                    "data": {"path": str(p), "filename": p.name, "file_type": p.suffix.lower()},
+                    "error": errors or "Docling could not convert the document.",
+                }
+
+            content = result.document.export_to_markdown()
+            status = "success" if result.status is ConversionStatus.SUCCESS else "partial_success"
+
+        return {
+            "success": True,
+            "tool": "read_file",
+            "data": {
+                "path": str(p),
+                "filename": p.name,
+                "file_type": p.suffix.lower(),
+                "extracted_content": content,
+                "status": status,
+            },
+            "error": None,
+        }
+    except Exception as e:
+        return {"success": False, "tool": "read_file", "data": {}, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# MAP - directory inspection
+# ---------------------------------------------------------------------------
+
+DEFAULT_IGNORE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".idea", ".vscode"}
+
+
+def map_files(path: str, max_depth: int = 8, max_entries: int = 5000) -> dict:
+    """Inspects a directory and returns a structured list of its files and folders.
+
+    Use this tool to see what exists on disk before reading, writing, or
+    deleting anything. Returns every file and subfolder under the given
+    directory (to max_depth), excluding ordinary noise like .git, .venv, and
+    __pycache__. Folders are listed with their subpaths so you know exactly
+    where a file lives before you touch it.
+
+    Args:
+        path (str): The directory to inspect.
+        max_depth (int): Maximum subdirectory depth to descend into (default 8).
+        max_entries (int): Maximum number of entries to return (default 5000).
+
+    Returns:
+        dict: {"success": bool, "tool": "map_files", "data": {...}, "error": str|None}
+            data keys: files (list of {name, path, extension, type, parent, level}),
+                        truncated (bool), max_entries (int)
+    """
+    root = Path(path)
+    if not root.exists() or not root.is_dir():
+        return {
+            "success": False,
+            "tool": "map_files",
+            "data": {},
+            "error": f"Path '{path}' is not a valid directory."
+        }
+
+    files_data = []
+    for current_dir, dirs, files in os.walk(root, topdown=True):
+        depth = len(Path(current_dir).relative_to(root).parts)
+        if depth >= max_depth:
+            dirs[:] = []
+        else:
+            dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE_DIRS]
+
+        for d in dirs:
+            if len(files_data) >= max_entries:
+                break
+            full = Path(current_dir) / d
+            files_data.append({
+                "name": d,
+                "path": str(full),
+                "extension": "",
+                "type": "directory",
+                "parent": Path(current_dir).name if Path(current_dir) != root else "",
+                "level": depth + 1,
+            })
+
+        for f in files:
+            if len(files_data) >= max_entries:
+                break
+            full = Path(current_dir) / f
+            files_data.append({
+                "name": f,
+                "path": str(full),
+                "extension": Path(f).suffix,
+                "type": "file",
+                "parent": Path(current_dir).name if Path(current_dir) != root else "",
+                "level": depth + 1,
+            })
+
+        if len(files_data) >= max_entries:
+            break
+
+    truncated = len(files_data) >= max_entries
+    return {
+        "success": True,
+        "tool": "map_files",
+        "data": {
+            "files": files_data,
+            "truncated": truncated,
+            "max_entries": max_entries,
+        },
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WRITE - file creation
+# ---------------------------------------------------------------------------
+
+def write_text_file(name: str, content: str, output_path: str, overwrite: bool = False) -> dict:
+    """Creates a text file containing the given content.
+
+    Use this tool to save any text or code you have produced to disk. The
+    parent directory is created automatically, so you do not need a separate
+    "create folder" step. By default an existing file with the same name is
+    NOT overwritten - pass overwrite=True when you intentionally want to.
+
+    Args:
+        name (str): File name to write, e.g. "summary.txt".
+        content (str): Full text content to write into the file.
+        output_path (str): Directory in which to create the file.
+        overwrite (bool): Whether to overwrite the file if it already exists
+            (default False).
+
+    Returns:
+        dict: {"success": bool, "tool": "write_text_file", "data": {...}, "error": str|None}
+            data keys: filename, path, type, size, status (built on success)
+    """
+    if not name or content is None or not output_path:
+        return {
+            "success": False,
+            "tool": "write_text_file",
+            "data": {},
+            "error": "Missing required arguments. Need name (file name), content (text), and output_path (folder)."
+        }
+
+    try:
+        out_dir = Path(output_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        file_path = out_dir / name
+
+        if file_path.exists() and not overwrite:
+            return {
+                "success": False,
+                "tool": "write_text_file",
+                "data": {},
+                "error": f"File '{file_path}' already exists and overwrite is set to False."
+            }
+
+        file_path.write_text(content, encoding="utf-8")
+        return {
+            "success": True,
+            "tool": "write_text_file",
+            "data": {
+                "filename": name,
+                "path": str(file_path),
+                "type": "text/plain",
+                "size": file_path.stat().st_size,
+                "status": "written",
+            },
+            "error": None,
+        }
+    except Exception as e:
+        return {"success": False, "tool": "write_text_file", "data": {}, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# DELETE - two-step approval-safe deletion
+# ---------------------------------------------------------------------------
+
+def delete_files(file_list: list, approved: bool = False) -> dict:
+    """Deletes files ONLY after explicit approval has been given.
+
+    Deleting is permanent. Calling this tool with approved=False (the safe
+    default) only PREPARES the deletion. Call it a second time with
+    approved=True to actually remove the files; the runtime additionally
+    blocks any path that was never proposed in the first (approved=False) call.
+
+    Args:
+        file_list (list): List of file paths to delete.
+        approved (bool): Must be True to actually delete. False only records
+            the pending request (two-step confirmation).
+
+    Returns:
+        dict: {"success": bool, "tool": "delete_files", "data": {...}, "error": str|None}
+            data keys: results (path -> "deleted"/"file_not_found"/"error: ..."),
+                        or pending_files (list) when approval is still required
+    """
+    if not file_list:
+        return {
+            "success": False,
+            "tool": "delete_files",
+            "data": {},
+            "error": "No files provided for deletion."
+        }
+
+    if not approved:
+        return {
+            "success": False,
+            "tool": "delete_files",
+            "data": {"pending_files": file_list},
+            "error": "Deletion requires explicit approval. Set approved=True to finalize."
+        }
+
+    results = {}
+    for f_path in file_list:
+        p = Path(f_path)
+        if p.exists() and p.is_file():
+            try:
+                p.unlink()
+                results[f_path] = "deleted" if not p.exists() else "failed_to_verify"
+            except Exception as e:
+                results[f_path] = f"error: {str(e)}"
+        else:
+            results[f_path] = "file_not_found"
+
+    all_success = all(v == "deleted" for v in results.values())
+    return {
+        "success": all_success,
+        "tool": "delete_files",
+        "data": {"results": results},
+        "error": None if all_success else "One or more files failed to delete.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# DATE / TIME
+# ---------------------------------------------------------------------------
 
 def get_current_date() -> str:
-    """Returns the real current date as a formatted string."""
+    """Returns the real current calendar date (e.g. 'Monday, January 05, 2026').
+
+    Use this tool when you need to know today's date - for example when a
+    user asks "what day is it", when dating a response, or when reasoning
+    about relative dates. No arguments.
+    """
+    from datetime import datetime
     return datetime.now().strftime("%A, %B %d, %Y")
 
 
 def tell_me_the_date_and_time() -> str:
-    """Returns the current date and time."""
+    """Returns the current date and time down to the second.
+
+    Use this tool for anything needing the moment now (date + time), like
+    timestamps, "what time is it", or checking elapsed time. No arguments.
+    """
+    from datetime import datetime
     now = datetime.now()
     return f"The current date and time is {now.strftime('%Y-%m-%d %H:%M:%S')}"
-````
 
-============================================================
-FOLDER: app/tools
-FILE: search.py
-============================================================
 
-````python
+# ---------------------------------------------------------------------------
+# SEARCH - chat transcript / RAG memory recall
+# ---------------------------------------------------------------------------
 
-"""
-app/tools/search.py
-===================
-
-Search tools for Terminator1. Hooks directly into the local RAG engine.
-"""
-
-import sys
-from pathlib import Path
-
-# Ensure the root of the project is on sys.path so we can import the 'rag' module
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from app import paths
+from app import paths  # noqa: E402
 
-# Location of the RAG store + the transcripts that feed it come from the
-# configured paths (UI-editable), not hardcoded values.
 RAG_DB_DIR = paths.RAG_DB_DIR
 CHAT_RECORDS_DIR = paths.CHAT_RECORDS_DIR
 
@@ -1569,37 +2220,40 @@ def _ensure_rag_ingested(storage) -> bool:
 
 
 def search_chat_logs(query: str) -> str:
-    """Searches past chat transcripts for keywords and returns the most relevant matching segments.
+    """Searches past chat transcripts for a keyword and returns the matching segments.
+
+    Use this tool to recall what was discussed in earlier conversations: this
+    is the agent's long-term memory. It searches the saved chat records and
+    returns the most relevant segments with their session title, speaker,
+    date, and content.
 
     Args:
         query (str): The search keyword, term, or phrase to look up.
+
+    Returns:
+        str: Formatted search results ('' when nothing matches).
     """
     try:
-        # Dynamically import to avoid any circular dependencies at startup
         from rag.search import RAGStorage
 
-        # Point to the persistent database folder (configurable).
         storage = RAGStorage(persist_dir=str(RAG_DB_DIR))
 
-        # Query the database
         results = storage.query(query, n_results=3)
 
-        # Self-heal: an empty store means the transcripts were never indexed.
-        # When rag.autoIngest is on, ingest them once, then query again.
         if not results:
             if _ensure_rag_ingested(storage):
                 results = storage.query(query, n_results=3)
 
         if not results:
             return f"No matches found in your chat transcripts for the query: '{query}'."
-            
+
         formatted_results = [f"--- RAG SEARCH RESULTS FOR: '{query}' ---"]
         for idx, r in enumerate(results):
             meta = r["metadata"]
             session_title = meta.get("session_title") or meta.get("source_file", "Untitled Chat")
             speaker = meta.get("speaker", "Unknown")
             date = meta.get("date", "Unknown Date")
-            
+
             formatted_results.append(
                 f"Result [{idx + 1}]:\n"
                 f"  Session: {session_title}\n"
@@ -1607,28 +2261,13 @@ def search_chat_logs(query: str) -> str:
                 f"  Content: {r['text']}\n"
                 f"----------------------------------------"
             )
-            
+
         return "\n\n".join(formatted_results)
-        
+
     except ImportError:
         return "Error: RAG engine modules not found. Ensure the 'rag/' folder is present in your project root."
     except Exception as e:
         return f"Error executing chat log search: {e}"
-````
-
-============================================================
-FOLDER: app/tools
-FILE: web.py
-============================================================
-
-````python
-"""
-app/tools/web.py
-================
-
-Web tools. Future tools such as web_search or read_url will live here
-and be registered in registry.py.
-"""
 ````
 
 ============================================================
@@ -3981,12 +4620,10 @@ FILE: agent.json
   "mode": "agent",
   "model": "gemma4:e2b",
   "tools": [
-    "create_folder",
-    "create_file",
-    "setup_venv",
     "read_file",
-    "write_file",
-    "read_pdf",
+    "write_text_file",
+    "map_files",
+    "delete_files",
     "get_current_date",
     "tell_me_the_date_and_time",
     "search_chat_logs"
@@ -4316,12 +4953,16 @@ FILE: agent.json
 {
   "id": "rag_assistant",
   "name": "RAG Assistant",
-  "description": "Chat-memory assistant that recalls past sessions by searching the local RAG database.",
+  "description": "Stateful agent with workspace file-management access and memory retrieval.",
   "mode": "agent",
   "model": "gemma4:e2b",
   "tools": [
     "search_chat_logs",
-    "get_current_date"
+    "get_current_date",
+    "map_files",
+    "read_file",
+    "write_text_file",
+    "delete_files"
   ]
 }
 ````
@@ -4335,63 +4976,46 @@ FILE: agent.md
 # RAG Assistant
 
 ## role
+You are the **RAG Assistant**, a secure workspace file-manager and memory-retrieval specialist.
 
-You are the **RAG Assistant**, a dedicated chat-memory retrieval specialist.
-
-Your primary purpose is to answer the user's questions about what happened in
-past chat sessions by searching the local RAG database with the
-`search_chat_logs` tool. You are the memory of the project.
+##
+Starndard greeting I am a RAG Assistant
 
 ## purpose
-
-Recall and summarize what was discussed, decided, or built in previous
-sessions, grounding every answer strictly in the records returned by the
-`search_chat_logs` tool.
-
-## personality
-
-You are precise, honest, and disciplined. You distinguish clearly between
-what is stored in the records and what is not. You never pretend to remember
-something you did not retrieve.
-
-## communication
-
-- Be concise and clear.
-- Answer directly, using the retrieved records.
-- Cite which session each fact came from (session title, speaker, date).
-- If you find multiple relevant records, summarize them together.
-- If nothing is found, say so plainly and briefly.
+Retrieve insights from past sessions and help Jesus discover, read, write, and manage workspace files safely.
 
 ## boundaries
+- **Past Memory:** When asked about past work, call `search_chat_logs`. Translate temporal keywords (like "last session") into topical terms.
+- **Workspace Discovery:** Use `map_files` to inspect workspace structure. Do not assume file paths.
+- **File Access:** Open text or document contents strictly via `read_file`. Keep the context window clean by only reading what is needed.
+- **Writing Results:** Write results using `write_text_file`. Ensure safety rules are followed.
+- **Grounding:** Ground every factual claim strictly in the retrieved logs or file contexts. Do not fabricate.
 
-- **Whenever the user asks about anything that happened 'earlier', 'last
-  session', 'yesterday', 'previously', 'before', 'what we did', or 'what we
-  worked on', you MUST call the `search_chat_logs` tool.** Do not answer from
-  memory or guess.
-- **CRITICAL: When calling `search_chat_logs`, translate temporal keywords
-  into topical keywords.** Do NOT search for literal phrases like 'last
-  session', 'yesterday', or 'earlier'. Search for the actual technical topics
-  involved, for example 'venv', 'chromadb', 'RAG', 'app tools', 'agent',
-  'test_app', 'FastAPI'. The records match on topic words, not on time words.
-- Never fabricate a fact or claim a record exists when the tool found none.
-- Do not invent citations, session titles, or quotes.
-- If the search tool reports an error, describe the error and how to fix it
-  (for example, run `python scripts/rebuild_rag.py` to rebuild the index).
-- Do not claim a tool was used when it was not.
+## how to call tools (critical)
+You can only take actions by ACTUALLY executing the tools given to you. To call a tool, emit ONLY a
+JSON object as your entire reply, with a `name` key and a `parameters` key:
 
-## principles
+    {"name": "read_file", "parameters": {"path": "E:\\data\\example.txt"}}
 
-- Ground every claim in the retrieved records.
-- Be accurate above all.
-- Separate what the records say from what is not in the records.
+- Use exactly `parameters` for the arguments object (the runtime also accepts `arguments` or `args`).
+- For multiple steps in one turn, emit a JSON ARRAY of such objects; each will be executed in order.
+- Never describe a call in words, never put calls inside Python/markdown code blocks, and never write
+  pseudo-code like `read_file("x")` — those are NOT executed.
+- Never invent or guess file paths or file contents. Only reference paths you actually saw in the
+  session state: `discovered_files`, `read_files`, `output_files`, or `pending_deletion`.
+- When reading many files, still read them one `read_file` call per file.
 
-## decision_style
+## safe deletion protocol (two-step confirmation)
+To ensure no files are deleted accidentally, you must strictly follow this two-step verification protocol:
 
-- Search first: inspect the tool result before composing the answer.
-- If the first search returns nothing useful, try one alternative set of
-  topical keywords before giving up.
-- If still nothing, say clearly that no stored record was found.
-- Do not make hidden assumptions.
+1. **Step 1: Request Deletion (Propose & Ask)**
+   - When files are identified as no longer needed, you must **NEVER** call `delete_files(..., approved=True)` first.
+   - You must first call `delete_files(file_list, approved=False)` to register the pending deletion.
+   - You must then explicitly present the list of files to Jesus and ask: *"Are you sure you want to delete these files? Please confirm to finalize."*
+
+2. **Step 2: Execute Deletion (After Approval)**
+   - Only after Jesus explicitly responds with confirmation (e.g., "yes", "go ahead", "approved", "confirm") are you authorized to execute the deletion.
+   - At this point, call `delete_files(file_list, approved=True)` to permanently remove the files and report the success or failure status back to Jesus.
 ````
 
 ============================================================
@@ -4402,6 +5026,12 @@ FILE: models.json
 ````json
 {
   "models": [
+    {
+      "id": "llama3.1:8b",
+      "name": "llama3.1:8b",
+      "source": "ollama",
+      "size": 4920753328
+    },
     {
       "id": "nomic-embed-text:latest",
       "name": "nomic-embed-text:latest",
@@ -4484,7 +5114,7 @@ FILE: index.html
         <section class="page">
 
             <header class="page-header" id="page-header">
-                <h1>Terminator1</h1>
+                <h1>Terminator 2</h1>
                 <p>Pick an agent below to chat with it in the floating chat, or use the chat button in the corner.</p>
             </header>
 
@@ -5765,6 +6395,15 @@ body {
 
         <button
             type="button"
+            class="sc-header-btn danger"
+            id="sc-rag-clear"
+            title="Reset the RAG memory store (all RAG DB entries reset to zero)">
+            <span>∅</span>
+            <span class="label">Clear Memory</span>
+        </button>
+
+        <button
+            type="button"
             class="sc-header-btn"
             id="sc-panel-toggle"
             aria-pressed="true"
@@ -6846,6 +7485,11 @@ const DOM = {
     deleteButton:
         document.getElementById(
             "sc-delete"
+        ),
+
+    ragClearButton:
+        document.getElementById(
+            "sc-rag-clear"
         )
 };
 
@@ -8103,6 +8747,63 @@ async function handleDeleteChat() {
 }
 
 
+/* Header "Clear Memory" button: reset the RAG memory store so the agent
+   starts with zero indexed segments. Only the store is wiped - saved chat
+   transcripts and chat records are untouched. */
+async function handleClearRagMemory() {
+
+    const confirmed =
+        window.confirm(
+            "Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero."
+        );
+
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/rag/reset",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+
+        if (!response.ok) {
+
+            const body =
+                await response.json().catch(() => ({}));
+
+            throw new Error(
+                String(body.detail || "") ||
+                `Server error ${response.status}`
+            );
+        }
+
+        const result =
+            await response.json();
+
+        setSaveStatus(
+            result.message ||
+                "RAG memory cleared - all RAG DB entries reset to zero.",
+            "ok"
+        );
+
+    } catch (error) {
+
+        setSaveStatus(
+            `Clear RAG memory failed: ${error.message}`,
+            "error"
+        );
+    }
+}
+
+
 window.__scActions = {
 
     save() {
@@ -8760,6 +9461,12 @@ DOM.deleteButton.addEventListener(
 );
 
 
+DOM.ragClearButton.addEventListener(
+    "click",
+    handleClearRagMemory
+);
+
+
 /* Keep the header title field and the panel "Chat title" field in sync
    live as the user types in either one. node.value writes are non-triggering,
    so the two listeners cannot loop. */
@@ -8839,7 +9546,7 @@ FILE: app_settings.json
 ````json
 {
   "defaultAgentId": "dev_assistant",
-  "defaultModel": "gemma4:e2b",
+  "defaultModel": "llama3.1:8b",
   "activeDiscussionId": "disc-mthko2ytzf9exz",
   "disableVersioning": false,
   "behavior": {
@@ -8869,13 +9576,17 @@ FILE: app_settings.json
         "enabled": true
       },
       {
-        "id": "custom-mtpctkwi-7lgm",
-        "name": "name species of cats",
+        "id": "custom-mtqa6k4j-s1wo",
+        "name": "Please help me consolidate my chat records in: E:\\data\\rag_s...",
         "agentId": "rag_assistant",
         "steps": [
-          "name species of cats",
-          "how many presidetns of the usa are there",
-          "who is the user"
+          "Please help me consolidate my chat records in: E:\\data\\rag_store\\chatlog\\agent-text-records",
+          "Follow these steps sequentially using your tools:",
+          "Run `map_files` on that directory to find all \".txt\" files.",
+          "Use `read_file` to open and extract the text from each discovered file.",
+          "Combine all the chat lines, remove any duplicate logs or repeat entries, and organize them into one chronological file.",
+          "Run `write_text_file` to save this clean consolidated log in that same directory as \"consolidated_chat_records.txt\".",
+          "Call `delete_files` with approved=False for all the original duplicate files you read, and ask me for my confirmation to permanently delete them."
         ],
         "expectedResult": {
           "mode": "type",
@@ -8890,7 +9601,8 @@ FILE: app_settings.json
   "rag": {
     "commitOnSave": false,
     "autoIngest": true
-  }
+  },
+  "chatSavePath": "E:\\data\\rag_store\\chatlog\\agent-text-records"
 }
 ````
 
@@ -13577,14 +14289,15 @@ function buildRagStoreManager() {
         const { ragStatus } = await import("../api/api.js");
         try {
             const st = await ragStatus();
-            info.textContent = `RAG store: ${st.path} — ${st.chunks} segment(s) indexed.`;
+            const status = st.status || st;
+            info.textContent = `RAG store: ${status.path} — ${status.chunks} segment(s) indexed.`;
         } catch (error) {
             info.textContent = `RAG store: ${error.message}`;
         }
     }
 
     purge.addEventListener("click", async () => {
-        if (!window.confirm("Forget everything in the RAG memory store? Saved chats are kept.")) {
+        if (!window.confirm("Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero.")) {
             return;
         }
         const { resetRag } = await import("../api/api.js");
@@ -14734,11 +15447,8 @@ short_circuit_1/
 │   │
 │   └── tools/
 │       ├── registry.py        # TOOL_REGISTRY: tool IDs -> Python functions
-│       ├── files.py           # read_file, write_file, read_pdf
-│       ├── workspace.py       # create_folder, create_file, setup_venv
-│       ├── datetime_tools.py  # get_current_date, tell_me_the_date_and_time
-│       ├── search.py          # (future search tools)
-│       └── web.py             # (future web tools)
+│       ├── state.py           # FileSession: shared file-working state for agents
+│       └── tools.py           # the 7 tools: map/read/write/delete + date/time + search
 │
 ├── agent_library/             # THE AGENTS - filesystem is the source of truth
 │   ├── basic_chat/            # agent.md + agent.json  (mode: chat, no tools)
@@ -14849,12 +15559,14 @@ Saved chats can be committed to a persistent RAG store so agents using the
   Transcripts follow **Chat save path**, not the Data folder; blank means
   `<dataDir>/chatlog/agent-text-records`.
 - **Manual maintenance:** `python scripts/rebuild_rag.py
-  [build|purge|status]` or the "Rebuild memory"/"Forget everything" buttons
-  in Configuration.
+  [build|purge|status]`, the "Rebuild memory"/"Forget everything" buttons
+  in Configuration, or the "Clear Memory" button in the chat header
+  (`static/chat.html`) — clear resets the store to zero entries.
 
 The store lives at `data/rag_db/chroma.sqlite3` by default. The store keeps
 embeddings even if the original transcripts are deleted, so recall keeps
-working until you run "Forget everything".
+working until you wipe it ("Forget everything" in Configuration, or "Clear
+Memory" in the chat header).
 
 ## Creating a new agent
 
@@ -14868,9 +15580,8 @@ Full field reference, tool catalog, copy-paste example, and troubleshooting:
 
 ## Adding a new tool
 
-1. Write the function in the right category module (`app/tools/files.py`,
-   `workspace.py`, ...) with a clear docstring — Ollama turns docstrings
-   into the tool schema the LLM sees.
+1. Write the function in `app/tools/tools.py` with a clear docstring —
+   Ollama turns docstrings into the tool schema the LLM sees.
 2. Add one line to `TOOL_REGISTRY` in `app/tools/registry.py`.
 3. Reference the ID in any agent's `agent.json`.
 
@@ -14937,7 +15648,7 @@ and definitions are re-read for every message. Edits apply immediately.
   "description": "Researches topics using web tools.",
   "mode": "agent",
   "model": null,
-  "tools": ["read_file", "write_file"]
+  "tools": ["read_file", "write_text_file"]
 }
 ```
 
@@ -15000,15 +15711,13 @@ IDs you can put in `"tools"` today:
 
 | ID | Category | Description |
 |---|---|---|
-| `read_file` | files.py | Reads and returns the contents of a text file. |
-| `write_file` | files.py | Writes or overwrites text content to a file. |
-| `read_pdf` | files.py | Extracts text contents from a PDF file. |
-| `create_folder` | workspace.py | Creates a directory at the specified path. |
-| `create_file` | workspace.py | Creates a new file with optional initial content. |
-| `setup_venv` | workspace.py | Creates a Python virtual environment (.venv). |
-| `get_current_date` | datetime_tools.py | Returns the real current date as a formatted string. |
-| `tell_me_the_date_and_time` | datetime_tools.py | Returns the current date and time. |
-| `search_chat_logs` | search.py | Searches past chat transcripts via the local RAG store (default `data/rag_db`, configurable from the UI). When it finds an empty store it self-heals by indexing every transcript once (`data/chatlog/agent-text-records/` by default) — only if "Auto-load transcripts" (`rag.autoIngest`) is on. Stores are rebuilt/cleared from Configuration → RAG memory or `scripts/rebuild_rag.py build\|purge\|status`. |
+| `map_files` | tools.py | Inspects a directory and returns a structured list of files/folders (to a depth). |
+| `read_file` | tools.py | Reads any file via IBM Docling and returns well-formatted markdown text (PDF/DOCX/PPTX/XLSX/HTML/images + plain text/code; OCR on by default). |
+| `write_text_file` | tools.py | Creates a text file (mkdir -p's the folder; overwrite=False by default). |
+| `delete_files` | tools.py | Deletes files only after explicit `approved=True` (two-step confirmation). |
+| `get_current_date` | tools.py | Returns the real current date. |
+| `tell_me_the_date_and_time` | tools.py | Returns the current date and time. |
+| `search_chat_logs` | tools.py | Searches past chat transcripts via the local RAG store (default `data/rag_db`, configurable from the UI). When it finds an empty store it self-heals by indexing every transcript once (`data/chatlog/agent-text-records/` by default) — only if "Auto-load transcripts" (`rag.autoIngest`) is on. Stores are rebuilt/cleared from Configuration → RAG memory or `scripts/rebuild_rag.py build\|purge\|status`. |
 
 Missing IDs produce a loud warning in the server console and are skipped:
 
@@ -15016,7 +15725,7 @@ Missing IDs produce a loud warning in the server console and are skipped:
 [TOOLS] WARNING: tool 'web_search' is listed in agent.json but missing from TOOL_REGISTRY - skipped
 ```
 
-To add a new tool: write the function in the right module under `app/tools/`
+To add a new tool: write the function in `app/tools/tools.py`
 with a clear docstring (Ollama turns docstrings into the schema the LLM
 sees), then add one line to `TOOL_REGISTRY` in `app/tools/registry.py`.
 
@@ -15035,7 +15744,7 @@ Create these two files, refresh the browser, done.
   "description": "Researches topics using local files and organized notes.",
   "mode": "agent",
   "model": null,
-  "tools": ["read_file", "write_file", "get_current_date"]
+  "tools": ["read_file", "write_text_file", "get_current_date"]
 }
 ```
 
@@ -15104,6 +15813,7 @@ FILE: requirements.txt
 # requirements.txt - Declares dependencies for the Stateful Agentic RAG Module
 # Designed to run locally on your Linux environment
 chromadb>=0.4.0
+docling>=2.59.0
 ollama>=0.3.0
 pydantic>=2.0.0
 
@@ -15322,7 +16032,7 @@ if __name__ == "__main__":
 
 ---
 
-## SECTION 3 — CHANGE LOG ARCHIVE (v1-1 .. v1-9)
+## SECTION 3 — CHANGE LOG ARCHIVE (v1-1 .. v1-11)
 
 ============================================================
 FOLDER: documentation
@@ -20184,6 +20894,603 @@ Rules:
   (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).
 ````
 
+============================================================
+FOLDER: documentation
+FILE: the_entire_enchilada_v1-10.txt
+============================================================
+
+````text
+=================================================================
+ the_entire_enchilada_v1-10.txt
+ UPDATES SINCE: the_entire_enchilada_v1-9.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.9)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-9.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+The tool-calling layer was consolidated and the file reader rebuilt
+around IBM Docling:
+
+  - TOOLS FOLDER COLLAPSED 13 -> 3 FILES. A full audit found the legacy
+    modules (files.py, workspace.py, datetime_tools.py, search.py,
+    web.py, the untracked file_map.py / file_reader.py / file_writer.py /
+    file_delete.py / file_session.py, and test_agent_toolkit.py)
+    contained overlapping, dead, or conflicting code - two `read_file`s,
+    `write_file` vs `write_text_file`, `read_pdf` duplicated inside
+    `file_reader.read_file`, and a stub `search_chat_logs` in rag/
+    search.py. Everything now lives in two modules plus the registry:
+
+        app/tools/state.py    -> ALL classes (FileSession)
+        app/tools/tools.py    -> ALL 7 tools, one function each
+        app/tools/registry.py -> unchanged public API, 7 registered IDs
+
+  - READ TOOL NOW USES IBM DOCLING. Plain text / code files (.txt, .md,
+    .log, ...) are still read directly off disk (fast path). Every other
+    format - PDF, DOCX, PPTX, XLSX, HTML, images - is converted by
+    `docling` into clean, structured markdown. OCR is ON by default
+    (scanned PDFs work out of the box); the converter is created once per
+    process and reused. First-ever conversion downloads the layout/OCR
+    model artifacts from HuggingFace and can take minutes; subsequent
+    calls are fast. `pypdf` is no longer needed.
+
+  - REGISTRY SHRANK 12 -> 7 TOOLS. Removed: `write_file`, `read_pdf`,
+    `create_folder`, `create_file`, `setup_venv` (all covered by the
+    consolidated read/write tools). Kept: `map_files`, `read_file`,
+    `write_text_file`, `delete_files`, `get_current_date`,
+    `tell_me_the_date_and_time`, `search_chat_logs`.
+
+  - DOCS RE-SYNC. `documentation/_make_snapshot.py` + this v1-10 delta;
+    `APP_SNAPSHOT.md` regenerated (49 files, 10 changelogs);
+    README.md + CREATING_AGENTS.md tool tables updated; the toolkit
+    integration log gained a ROUND 4 entry.
+
+=================================================================
+ 2. FILE: app/tools/state.py                       (NEW FILE)
+=================================================================
+All classes in one module. `FileSession` moved from the deleted
+`app/tools/file_session.py` with an expanded, purpose-documenting class
+docstring. Same six state lists and the same public methods
+(`add_discovered`, `select_files`, `record_read`, `add_output`,
+`mark_for_deletion`, `get_state`) - no behavior change.
+
+=================================================================
+ 3. FILE: app/tools/tools.py                       (NEW FILE)
+=================================================================
+The consolidated home of every tool. One plain function per tool; the
+docstrings were rewritten so they carry what the LLM needs (Ollama turns
+name + signature + docstring into the tool schema, and PromptManager
+uses the first line for the AVAILABLE TOOLS prompt section).
+
+   3.1  `read_file(path: str, ocr: bool = True) -> dict`
+
+           _is_plain_text() fast path for .txt/.md/.log/code/csv/json/...
+           otherwise:
+               converter = _docling_converter(ocr)   # cached per ocr flag
+               result = converter.convert(str(p), max_num_pages=400)
+               if result.status is ConversionStatus.FAILURE:
+                   ... error dict with result.errors ...
+               content = result.document.export_to_markdown()
+
+        Returns the SAME data shape as before (`path`, `filename`,
+        `file_type`, `extracted_content`, `status`) so
+        `factory._record_result` and session injection are untouched.
+
+   3.2  `map_files(path, max_depth=8, max_entries=5000)` - as before
+        (os.walk pruning + depth/entry caps); the dead
+        `pretty_print_tree` helper is gone.
+
+   3.3  `write_text_file(name, content, output_path, overwrite=False)` -
+        as before; its `mkdir(parents=True)` absorbs the removed
+        workspace create_folder / create_file tools.
+
+   3.4  `delete_files(file_list, approved=False)` - as before (two-step
+        approval; runtime gate in factory.py is retained).
+
+   3.5  `get_current_date()` / `tell_me_the_date_and_time()` - moved
+        from datetime_tools.py, docstrings expanded.
+
+   3.6  `search_chat_logs(query)` + private `_auto_ingest_enabled()` /
+        `_ensure_rag_ingested()` helpers - moved from search.py,
+        unchanged logic.
+
+=================================================================
+ 4. FILE: app/tools/registry.py                    (CHANGED - THIS ROUND)
+=================================================================
+Full rewrite. Consumes `app.tools.tools` instead of the deleted modules;
+the public API and behavior are byte-for-byte the same:
+
+    _TOOL_REGISTRY = {
+        "map_files": map_files,
+        "read_file": read_file,
+        "write_text_file": write_text_file,
+        "delete_files": delete_files,
+        "get_current_date": get_current_date,
+        "tell_me_the_date_and_time": tell_me_the_date_and_time,
+        "search_chat_logs": search_chat_logs,
+    }
+
+`get()`, `list_tools()`, `available_tool_ids()`, `resolve_tools()`,
+`get_session()` unchanged. The shared `_session = FileSession()`
+instance now imports FileSession from `app.tools.state`.
+
+=================================================================
+ 5. DELETED FILES                                  (THIS ROUND)
+=================================================================
+The following modules were removed (implementations consolidated into
+tools.py / state.py; no dead code, stubs, or broken test harness kept):
+
+    app/tools/datetime_tools.py
+    app/tools/files.py            (legacy read_file/write_file/read_pdf)
+    app/tools/search.py
+    app/tools/web.py              (empty placeholder)
+    app/tools/workspace.py
+    app/tools/file_map.py         (was untracked on disk)
+    app/tools/file_reader.py      (was untracked on disk)
+    app/tools/file_writer.py      (was untracked on disk)
+    app/tools/file_delete.py      (was untracked on disk)
+    app/tools/file_session.py     (was untracked on disk)
+    app/tools/test_agent_toolkit.py (was untracked on disk; imported
+        `from file_map import ...` and would not even run)
+
+=================================================================
+ 6. FILE: app/core/agent.py                        (CHANGED - THIS ROUND)
+=================================================================
+One import line only:
+
+    - from app.tools.file_session import FileSession
+    + from app.tools.state import FileSession
+
+=================================================================
+ 7. FILE: app/agents/factory.py                    (CHANGED - THIS ROUND)
+=================================================================
+Same one-line import swap inside `_record_result`:
+
+    - from app.tools.file_session import FileSession
+    + from app.tools.state import FileSession
+
+No other change: `resolve_tools`, `get_session`, `_session_aware`, the
+delete-approval gate (keyed on the tool name `delete_files` and the
+`data["pending_files"]` key), and `_record_result` (keyed on `map_files`
+/ `read_file` / `write_text_file` / `delete_files`) all keep working
+because every surviving tool name and response shape is unchanged.
+
+=================================================================
+ 8. FILE: requirements.txt                          (CHANGED - THIS ROUND)
+=================================================================
+Added after the chromadb line:
+
+    docling>=2.59.0
+
+(2.59.0 is the first release with Python 3.14 support; 2.126.0 installed
+in the venv during verification. Docling brings its own PDF/office/
+OCR engines, so no separate pypdf dependency is needed - there was none
+in requirements.txt.)
+
+=================================================================
+ 9. FILE: agent_library/dev_assistant/agent.json   (CHANGED - THIS ROUND)
+=================================================================
+The "tools" array shrank from 9 IDs to the 7 consolidated ones:
+
+    - create_folder, create_file, setup_venv, write_file, read_pdf
+    + map_files, delete_files
+
+Before:
+    "tools": [ "create_folder", "create_file", "setup_venv",
+               "read_file", "write_file", "read_pdf",
+               "get_current_date", "tell_me_the_date_and_time",
+               "search_chat_logs" ]
+After:
+    "tools": [ "read_file", "write_text_file", "map_files",
+               "delete_files", "get_current_date",
+               "tell_me_the_date_and_time", "search_chat_logs" ]
+
+Functionally equivalent: write_text_file mkdir -p's folders, read_file
+handles PDFs via Docling, and delete_files replaces the ad-hoc single
+file steps. agent_library/rag_assistant/agent.json was already using
+only kept tools and needed NO change.
+
+=================================================================
+ 10. FILE: documentation/CREATING_AGENTS.md        (CHANGED - THIS ROUND)
+=================================================================
+   - "Available tools" table replaced with the 7 current tools, all
+     sourced from tools.py (map_files, read_file w/ Docling + OCR note,
+     write_text_file, delete_files, get_current_date,
+     tell_me_the_date_and_time, search_chat_logs).
+   - Example agent.json `"tools"` arrays updated: `write_file` ->
+     `write_text_file` (two occurrences).
+   - "To add a new tool" guidance now points at `app/tools/tools.py`
+     + `TOOL_REGISTRY` in registry.py.
+
+=================================================================
+ 11. FILE: README.md                               (CHANGED - THIS ROUND)
+=================================================================
+   - tools/ tree block: five legacy file rows replaced with
+     `state.py` (FileSession) + `tools.py` (the 7 tools) under registry.py.
+   - "Adding a new tool" section: "right category module (files.py,
+     workspace.py, ...)" replaced with "`app/tools/tools.py`".
+
+=================================================================
+ 12. FILE: documentation/_make_snapshot.py         (CHANGED - THIS ROUND)
+=================================================================
+   12.1  FILES manifest: the five legacy tool rows
+         (files.py, workspace.py, datetime_tools.py, search.py, web.py)
+         replaced by `app/tools/state.py` + `app/tools/tools.py`
+         (49 embedded files total).
+   12.2  TREE (Section 1): tools/ block now reads
+         `registry.py` / `state.py` / `tools.py`; a
+         `the_entire_enchilada_v1-10.txt` row was added to the
+         documentation/ listing.
+   12.3  CHANGELOGS list gains v1-10 (10 entries); the Section 3 header
+         and the opener bullet now read "(v1-1 .. v1-10)".
+   12.4  DOCSCRIPT_PROMPT refreshed: changelog list runs to v1-10; the
+         "next delta" example becomes `the_entire_enchilada_v1-11.txt`.
+
+=================================================================
+ 13. FILE: documentation/APP_SNAPSHOT.md           (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits): Section 2 embeds the 49-file manifest incl. the new
+`state.py` / `tools.py`; Section 3 archives 10 changelogs (v1-1 .. v1-10).
+
+=================================================================
+ 14. FILE: documentation/TOOLKIT_INTEGRATION_LOG.md (CHANGED - THIS ROUND)
+=================================================================
+Gained a ROUND 4 entry at the top documenting the consolidation + Docling
+work, and the now-stale "Current tool registry (12 tools)" table +
+"Notes for the Future" were updated to the 7-tool / tools.py reality.
+
+=================================================================
+ 15. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `python -m compileall app` - passes (state.py, tools.py, registry.py
+     included).
+   - Tools import + resolve: `registry.list_tools()` returns exactly the
+     7 kept IDs; every tool's docstring first line renders in the
+     AVAILABLE TOOLS prompt format.
+   - Smoke tests: read_file on a .txt (fast path) and on a generated
+     one-page PDF via Docling (`## Hello Docling World` extracted;
+     first conversion ~216s incl. one-time HF model downloads, cached
+     afterwards); write_text_file mkdir + write; map_files listing;
+     delete_files pending-approval shape.
+   - `build_agent('basic_chat')` (0 tools), `build_agent('rag_assistant')`
+     (6 tools), `build_agent('dev_assistant')` (7 tools) all build.
+   - `python -m unittest rag.test_app -v` - 5/5 pass.
+   - `python documentation/_make_snapshot.py` ran clean: 49 files / 10
+     changelogs, APP_SNAPSHOT.md regenerated.
+   - Grep confirms no remaining imports of the deleted tool modules in
+     live code; the only old-path references left live inside the
+     historical changelog archives (intentionally unmodified).
+
+=================================================================
+ 16. FILES NOT CHANGED (confirmed this round)
+=================================================================
+   - app/core/llm.py, app/core/prompt.py
+   - app/agents/loader.py, app/agents/registry.py
+   - app/chat_store/__init__.py, app/chat_store/logger.py,
+     app/chat_store/store.py
+   - app/rag_commit.py, app/paths.py, rag/ingest.py, rag/search.py,
+     rag/main.py
+   - agent_library/basic_chat/*, agent_library/rag_assistant/*
+     (except rag_assistant/agent.md which carried PRE-EXISTING
+     uncommitted edits unrelated to this round),
+     agent_library/problem_discovery_agent/*
+   - config/settings.json
+   - static/* (all frontend)
+   - scripts/version_chats.py, scripts/rebuild_rag.py
+   - the_entire_enchilada.txt and v1.txt .. v1-9.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 17. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-10.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-9.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (backend under `app/`
+   and `rag/`, frontend under `static/`, plus config, requirements.txt,
+   scripts, agent_library/) against the versions/descriptions captured
+   in `the_entire_enchilada_v1-10.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-11.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).
+````
+
+============================================================
+FOLDER: documentation
+FILE: the_entire_enchilada_v1-11.txt
+============================================================
+
+````text
+=================================================================
+ the_entire_enchilada_v1-11.txt
+ UPDATES SINCE: the_entire_enchilada_v1-10.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.10)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-10.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+The RAG memory store gained a user-facing "reset to zero" control in the
+chat UI, and the config page's RAG-store dialogs/reporting were brought
+in line:
+
+  - CHAT HEADER GAINED A "CLEAR MEMORY" BUTTON. `static/chat.html` now
+    has a danger-styled `sc-rag-clear` button ("∅ Clear Memory") next to
+    the Delete button. Pushing it pops a confirmation dialog warning that
+    ALL RAG DB ENTRIES WILL BE RESET TO ZERO, then POSTs to
+    `/api/rag/reset` (the same endpoint the config page's "Forget
+    everything" uses) and reports the outcome in the save-status line.
+    Only the index store is wiped - saved chat transcripts and chat
+    records are untouched.
+
+  - CONFIG PAGE: SAME DIALOG + A STATUS-LINE FIX. The "Forget everything"
+    button in `static/js/ui/config-form.js` now shows the identical
+    "reset to zero" confirmation instead of its old "Saved chats are
+    kept" wording. A pre-existing bug where the RAG status line always
+    read "undefined — undefined segment(s) indexed." was also fixed:
+    `/api/rag/status` returns `{"status": {...}}`, and the refresh()
+    function was reading `st.path`/`st.chunks` off the wrapper instead of
+    `st.status`.
+
+  - DOCS RE-SYNC. `documentation/_make_snapshot.py` + this v1-11 delta;
+    `APP_SNAPSHOT.md` regenerated (49 files, 11 changelogs); README's RAG
+    maintenance note now mentions the chat-header button; the toolkit
+    integration log gained a ROUND 5 entry.
+
+=================================================================
+ 2. FILE: static/chat.html                          (CHANGED - THIS ROUND)
+=================================================================
+Three additions (no existing code removed):
+
+   2.1  HEADER BUTTON - inserted immediately after the `sc-delete`
+        button inside `.sc-header-actions`:
+
+            <button
+                type="button"
+                class="sc-header-btn danger"
+                id="sc-rag-clear"
+                title="Reset the RAG memory store (all RAG DB entries reset to zero)">
+                <span>∅</span>
+                <span class="label">Clear Memory</span>
+            </button>
+
+   2.2  DOM REGISTRY - `ragClearButton` added after `deleteButton`:
+
+            ragClearButton:
+                document.getElementById(
+                    "sc-rag-clear"
+                )
+
+   2.3  HANDLER + WIRING. New async function `handleClearRagMemory()`
+        placed right before `window.__scActions = {` (mirroring the
+        existing `handleDeleteChat` pattern - same fetch/confirm style):
+
+            async function handleClearRagMemory() {
+                const confirmed =
+                    window.confirm(
+                        "Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero."
+                    );
+                if (!confirmed) { return; }
+                try {
+                    const response =
+                        await fetch("/api/rag/reset", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" }
+                        });
+                    if (!response.ok) {
+                        const body = await response.json().catch(() => ({}));
+                        throw new Error(
+                            String(body.detail || "") ||
+                            `Server error ${response.status}`
+                        );
+                    }
+                    const result = await response.json();
+                    setSaveStatus(
+                        result.message ||
+                            "RAG memory cleared - all RAG DB entries reset to zero.",
+                        "ok"
+                    );
+                } catch (error) {
+                    setSaveStatus(
+                        `Clear RAG memory failed: ${error.message}`,
+                        "error"
+                    );
+                }
+            }
+
+        ...and the event listener alongside the Save/Delete wiring:
+
+            DOM.ragClearButton.addEventListener(
+                "click",
+                handleClearRagMemory
+            );
+
+The button intentionally calls the existing store endpoint
+(`POST /api/rag/reset` -> `app/rag_commit.purge_store`), so the
+chat page and config page now share one "wipe the store" path.
+
+=================================================================
+ 3. FILE: static/js/ui/config-form.js               (CHANGED - THIS ROUND)
+=================================================================
+Two small edits inside `buildRagStoreManager()`:
+
+   3.1  refresh() status-line bug fix. `/api/rag/status` returns
+        `{"status": {...}}`, but refresh() read `st.path` / `st.chunks`
+        (undefined on the wrapper object), so the info line always
+        rendered "RAG store: undefined — undefined segment(s) indexed.".
+        Now it unwraps first:
+
+            -   info.textContent = `RAG store: ${st.path} — ${st.chunks} segment(s) indexed.`;
+            +   const status = st.status || st;
+            +   info.textContent = `RAG store: ${status.path} — ${status.chunks} segment(s) indexed.`;
+
+   3.2  purge ("Forget everything") confirmation dialog wording replaced
+        so both UIs warn identically that the store resets to zero:
+
+            -   if (!window.confirm("Forget everything in the RAG memory store? Saved chats are kept.")) {
+            +   if (!window.confirm("Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero.")) {
+
+No other changes: the `resetRag()` / `rebuildRag()` calls, the button
+labels ("Forget everything" / "Rebuild memory"), the `ragStatus()`
+import and the per-run refresh() all work as before.
+
+=================================================================
+ 4. FILE: documentation/_make_snapshot.py           (CHANGED - THIS ROUND)
+=================================================================
+   4.1  Module + section docstrings updated: the "change-log archive"
+        range notes bumped to "(v1-1 .. v1-11)".
+   4.2  CHANGELOGS list gains v1-11 (11 entries).
+   4.3  `build_archive()` Section 3 header text bumped to
+        "(v1-1 .. v1-11)".
+   4.4  TREE (Section 1): a `the_entire_enchilada_v1-11.txt` row added to
+        the documentation/ listing right after the v1-10 row.
+   4.5  The snapshot opener bullet (line ~289) bumped to
+        "(v1-1 .. v1-11)".
+   4.6  DOCSCRIPT_PROMPT refreshed: changelog list runs to v1-11; the
+        "next delta" example becomes `the_entire_enchilada_v1-12.txt`.
+
+=================================================================
+ 5. FILE: documentation/APP_SNAPSHOT.md             (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits): Section 2 re-embeds the 49-file manifest incl. the
+updated `chat.html` and `config-form.js`; Section 3 archives 11
+changelogs (v1-1 .. v1-11).
+
+=================================================================
+ 6. FILE: documentation/TOOLKIT_INTEGRATION_LOG.md  (CHANGED - THIS ROUND)
+=================================================================
+Gained a ROUND 5 entry at the top (dated September 7, 2026)
+documenting the chat-header "Clear Memory" button, the shared
+reset-to-zero confirmation dialog on the config page, and the RAG
+status-line fix. The header date line now reads "September 6, 2026
+(ROUND 4 / ROUND 5: September 7, 2026)".
+
+=================================================================
+ 7. FILE: README.md                                 (CHANGED - THIS ROUND)
+=================================================================
+One line under "RAG memory store" -> "Manual maintenance":
+
+    - **Manual maintenance:** `python scripts/rebuild_rag.py
+      [build|purge|status]`, the "Rebuild memory"/"Forget everything"
+      buttons in Configuration, or the "Clear Memory" button in the
+      chat header (`static/chat.html`).
+
+The trailing note about the store keeping embeddings after transcripts
+are deleted now also cross-references the chat-header button as the
+quick way to wipe it.
+
+=================================================================
+ 8. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `node --check static/js/ui/config-form.js` passes.
+   - Both inline `<script>` blocks of `static/chat.html` extracted and
+     `node --check`'d - pass (incl. the new `handleClearRagMemory`).
+   - `grep` confirms the new identifiers exist exactly once each:
+     `sc-rag-clear` (button + DOM lookup), `ragClearButton`,
+     `handleClearRagMemory`, and the "reset to zero" confirm text in
+     both `chat.html` and `config-form.js`.
+   - `/api/rag/reset`, `/api/rag/rebuild`, `/api/rag/status` endpoints
+     confirmed present in server.py (unchanged this round - the new
+     button just calls the existing one).
+   - `python documentation/_make_snapshot.py` runs clean: 49 files /
+     11 changelogs, APP_SNAPSHOT.md regenerated.
+   - Manual smoke check omitted deliberately: clicking the button
+     requires a running server; the handler path is identical to the
+     existing, working config-page `resetRag()` flow.
+
+=================================================================
+ 9. FILES NOT CHANGED (confirmed this round)
+=================================================================
+   - server.py, all of app/ (incl. app/core, app/agents, app/tools,
+     app/chat_store, app/paths.py, app/rag_commit.py)
+   - rag/ (ingest.py, search.py, main.py)
+   - agent_library/* (all agents, agent.md + agent.json)
+   - config/models.json, config/settings.json, static/config/app_settings.json
+   - static/index.html, static/css/*, static/js/app.js, api.js,
+     static/js/classes/*, static/js/logic/*, static/js/ui/agents.js,
+     config.js, markdown.js, appearance.js, chat-tests.js
+   - scripts/version_chats.py, scripts/rebuild_rag.py
+   - requirements.txt
+   - the_entire_enchilada.txt and v1.txt .. v1-10.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 10. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-11.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-10.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (backend under `app/`
+   and `rag/`, frontend under `static/`, plus config, requirements.txt,
+   scripts, agent_library/) against the versions/descriptions captured
+   in `the_entire_enchilada_v1-11.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-12.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).
+````
+
 ---
 
 ## SECTION 4 — DOCSCRIPT (AI DOCUMENTATION MAINTENANCE PROMPT)
@@ -20209,6 +21516,8 @@ The documentation lives in `documentation/`:
   - `the_entire_enchilada_v1-7.txt` NET-DELTA change log (V1.6 -> V1.7)
   - `the_entire_enchilada_v1-8.txt` NET-DELTA change log (V1.7 -> V1.8)
   - `the_entire_enchilada_v1-9.txt` NET-DELTA change log (V1.8 -> V1.9)
+  - `the_entire_enchilada_v1-10.txt` NET-DELTA change log (V1.9 -> V1.10)
+  - `the_entire_enchilada_v1-11.txt` NET-DELTA change log (V1.10 -> V1.11)
 
 STEP-BY-STEP:
 
@@ -20224,8 +21533,8 @@ STEP-BY-STEP:
    - If `APP_SNAPSHOT.md` is stale, regenerate it with
      `python documentation/_make_snapshot.py` (this also refreshes this section
      and embeds the whole change-log archive as Section 3).
-   - If new/changed behavior is significant, write the NEXT delta file
-     (e.g. `the_entire_enchilada_v1-10.txt`) in the exact NET-DELTA style used
+- If new/changed behavior is significant, write the NEXT delta file
+   (e.g. `the_entire_enchilada_v1-12.txt`) in the exact NET-DELTA style used
      by the previous delta file: a header banner naming the revision and the
      file it diffs against, a short overarching summary, per-file sections
      quoting exact new/removed/reworded code, an explicit "FILES NOT CHANGED"

@@ -1242,6 +1242,15 @@ body {
 
         <button
             type="button"
+            class="sc-header-btn danger"
+            id="sc-rag-clear"
+            title="Reset the RAG memory store (all RAG DB entries reset to zero)">
+            <span>∅</span>
+            <span class="label">Clear Memory</span>
+        </button>
+
+        <button
+            type="button"
             class="sc-header-btn"
             id="sc-panel-toggle"
             aria-pressed="true"
@@ -2323,6 +2332,11 @@ const DOM = {
     deleteButton:
         document.getElementById(
             "sc-delete"
+        ),
+
+    ragClearButton:
+        document.getElementById(
+            "sc-rag-clear"
         )
 };
 
@@ -3580,6 +3594,63 @@ async function handleDeleteChat() {
 }
 
 
+/* Header "Clear Memory" button: reset the RAG memory store so the agent
+   starts with zero indexed segments. Only the store is wiped - saved chat
+   transcripts and chat records are untouched. */
+async function handleClearRagMemory() {
+
+    const confirmed =
+        window.confirm(
+            "Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero."
+        );
+
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/rag/reset",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+
+        if (!response.ok) {
+
+            const body =
+                await response.json().catch(() => ({}));
+
+            throw new Error(
+                String(body.detail || "") ||
+                `Server error ${response.status}`
+            );
+        }
+
+        const result =
+            await response.json();
+
+        setSaveStatus(
+            result.message ||
+                "RAG memory cleared - all RAG DB entries reset to zero.",
+            "ok"
+        );
+
+    } catch (error) {
+
+        setSaveStatus(
+            `Clear RAG memory failed: ${error.message}`,
+            "error"
+        );
+    }
+}
+
+
 window.__scActions = {
 
     save() {
@@ -4234,6 +4305,12 @@ DOM.saveButton.addEventListener(
 DOM.deleteButton.addEventListener(
     "click",
     handleDeleteChat
+);
+
+
+DOM.ragClearButton.addEventListener(
+    "click",
+    handleClearRagMemory
 );
 
 

@@ -6,7 +6,7 @@ manifest paths and the OUTPUT file still point at the repository root.
 
 Section 1 -> file structure
 Section 2 -> folder + file name + full contents of every file
-Section 3 -> change-log archive (the_entire_enchilada v1-1 .. v1-9)
+Section 3 -> change-log archive (the_entire_enchilada v1-1 .. v1-11)
 Section 4 -> a docscript AI prompt that keeps the docs in sync with the app
 """
 from pathlib import Path
@@ -26,11 +26,8 @@ FILES = [
     "app/agents/registry.py",
     "app/agents/factory.py",
     "app/tools/registry.py",
-    "app/tools/files.py",
-    "app/tools/workspace.py",
-    "app/tools/datetime_tools.py",
-    "app/tools/search.py",
-    "app/tools/web.py",
+    "app/tools/state.py",
+    "app/tools/tools.py",
     "app/paths.py",
     "app/rag_commit.py",
     "rag/ingest.py",
@@ -90,11 +87,8 @@ terminator1/  (Terminator1)
 │   │
 │   ├── tools/
 │   │   ├── registry.py        # TOOL_REGISTRY: tool IDs -> Python functions
-│   │   ├── files.py           # read_file, write_file, read_pdf
-│   │   ├── workspace.py       # create_folder, create_file, setup_venv
-│   │   ├── datetime_tools.py  # get_current_date, tell_me_the_date_and_time
-│   │   ├── search.py          # (future search tools)
-│   │   └── web.py             # (future web tools)
+│   │   ├── state.py           # FileSession: shared file-working state for agents
+│   │   └── tools.py           # the 7 tools: map/read/write/delete + date/time + search
 │   │
 │   └── chat_store/            # chat log ownsership (one active chat, JSONL records)
 │       ├── __init__.py        # package marker
@@ -150,8 +144,9 @@ terminator1/  (Terminator1)
 │   ├── the_entire_enchilada_v1-5.txt     # NET-DELTA log (V1.4 -> V1.5)
 │   ├── the_entire_enchilada_v1-6.txt     # NET-DELTA log (V1.5 -> V1.6)
 │   ├── the_entire_enchilada_v1-7.txt     # NET-DELTA log (V1.6 -> V1.7)
-│   ├── the_entire_enchilada_v1-8.txt     # NET-DELTA log (V1.7 -> V1.8)
-│   └── the_entire_enchilada_v1-9.txt     # NET-DELTA log (V1.8 -> V1.9)
+│   ├── the_entire_enchilada_v1-9.txt     # NET-DELTA log (V1.8 -> V1.9)
+│   └── the_entire_enchilada_v1-10.txt    # NET-DELTA log (V1.9 -> V1.10)
+│   └── the_entire_enchilada_v1-11.txt    # NET-DELTA log (V1.10 -> V1.11)
 │
 ├── README.md                  # architecture map + quickstart
 ├── requirements.txt           # pinned dependencies
@@ -181,7 +176,7 @@ def lang_for(path: str) -> str:
 # SECTION 3 - CHANGE LOG ARCHIVE
 # ---------------------------------------------------------------------------
 # Verbatim copies of every NET-DELTA changelog version so the snapshot is a
-# complete history of the application (v1-1 .. v1-8).
+# complete history of the application (v1-1 .. v1-11).
 
 CHANGELOGS = [
     "documentation/the_entire_echilada_v1-1.txt",
@@ -193,11 +188,13 @@ CHANGELOGS = [
     "documentation/the_entire_enchilada_v1-7.txt",
     "documentation/the_entire_enchilada_v1-8.txt",
     "documentation/the_entire_enchilada_v1-9.txt",
+    "documentation/the_entire_enchilada_v1-10.txt",
+    "documentation/the_entire_enchilada_v1-11.txt",
 ]
 
 
 def build_archive() -> str:
-    header = "\n---\n\n## SECTION 3 — CHANGE LOG ARCHIVE (v1-1 .. v1-9)\n"
+    header = "\n---\n\n## SECTION 3 — CHANGE LOG ARCHIVE (v1-1 .. v1-11)\n"
     parts = [header]
     for rel in CHANGELOGS:
         f = ROOT / rel
@@ -249,6 +246,8 @@ The documentation lives in `documentation/`:
   - `the_entire_enchilada_v1-7.txt` NET-DELTA change log (V1.6 -> V1.7)
   - `the_entire_enchilada_v1-8.txt` NET-DELTA change log (V1.7 -> V1.8)
   - `the_entire_enchilada_v1-9.txt` NET-DELTA change log (V1.8 -> V1.9)
+  - `the_entire_enchilada_v1-10.txt` NET-DELTA change log (V1.9 -> V1.10)
+  - `the_entire_enchilada_v1-11.txt` NET-DELTA change log (V1.10 -> V1.11)
 
 STEP-BY-STEP:
 
@@ -264,8 +263,8 @@ STEP-BY-STEP:
    - If `APP_SNAPSHOT.md` is stale, regenerate it with
      `python documentation/_make_snapshot.py` (this also refreshes this section
      and embeds the whole change-log archive as Section 3).
-   - If new/changed behavior is significant, write the NEXT delta file
-     (e.g. `the_entire_enchilada_v1-10.txt`) in the exact NET-DELTA style used
+- If new/changed behavior is significant, write the NEXT delta file
+   (e.g. `the_entire_enchilada_v1-12.txt`) in the exact NET-DELTA style used
      by the previous delta file: a header banner naming the revision and the
      file it diffs against, a short overarching summary, per-file sections
      quoting exact new/removed/reworded code, an explicit "FILES NOT CHANGED"
@@ -290,7 +289,7 @@ parts.append(
     "Complete self-contained copy of the application as of last update.\n\n"
     "- **Section 1** — file structure\n"
     "- **Section 2** — folder + file name + full contents of every file\n"
-    "- **Section 3** — change-log archive (the_entire_enchilada v1-1 .. v1-9)\n"
+    "- **Section 3** — change-log archive (the_entire_enchilada v1-1 .. v1-11)\n"
     "- **Section 4** — endpoint definitions, variables, and an AI PROMPT with "
     "step-by-step instructions for replicating the application\n"
 )

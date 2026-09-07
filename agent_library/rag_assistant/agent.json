@@ -1,11 +1,15 @@
 {
   "id": "rag_assistant",
   "name": "RAG Assistant",
-  "description": "Chat-memory assistant that recalls past sessions by searching the local RAG database.",
+  "description": "Stateful agent with workspace file-management access and memory retrieval.",
   "mode": "agent",
   "model": "gemma4:e2b",
   "tools": [
     "search_chat_logs",
-    "get_current_date"
+    "get_current_date",
+    "map_files",
+    "read_file",
+    "write_text_file",
+    "delete_files"
   ]
 }

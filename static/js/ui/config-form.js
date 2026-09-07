@@ -162,14 +162,15 @@ function buildRagStoreManager() {
         const { ragStatus } = await import("../api/api.js");
         try {
             const st = await ragStatus();
-            info.textContent = `RAG store: ${st.path} — ${st.chunks} segment(s) indexed.`;
+            const status = st.status || st;
+            info.textContent = `RAG store: ${status.path} — ${status.chunks} segment(s) indexed.`;
         } catch (error) {
             info.textContent = `RAG store: ${error.message}`;
         }
     }
 
     purge.addEventListener("click", async () => {
-        if (!window.confirm("Forget everything in the RAG memory store? Saved chats are kept.")) {
+        if (!window.confirm("Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero.")) {
             return;
         }
         const { resetRag } = await import("../api/api.js");

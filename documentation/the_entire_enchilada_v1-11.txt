@@ -1,0 +1,257 @@
+=================================================================
+ the_entire_enchilada_v1-11.txt
+ UPDATES SINCE: the_entire_enchilada_v1-10.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.10)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-10.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+The RAG memory store gained a user-facing "reset to zero" control in the
+chat UI, and the config page's RAG-store dialogs/reporting were brought
+in line:
+
+  - CHAT HEADER GAINED A "CLEAR MEMORY" BUTTON. `static/chat.html` now
+    has a danger-styled `sc-rag-clear` button ("∅ Clear Memory") next to
+    the Delete button. Pushing it pops a confirmation dialog warning that
+    ALL RAG DB ENTRIES WILL BE RESET TO ZERO, then POSTs to
+    `/api/rag/reset` (the same endpoint the config page's "Forget
+    everything" uses) and reports the outcome in the save-status line.
+    Only the index store is wiped - saved chat transcripts and chat
+    records are untouched.
+
+  - CONFIG PAGE: SAME DIALOG + A STATUS-LINE FIX. The "Forget everything"
+    button in `static/js/ui/config-form.js` now shows the identical
+    "reset to zero" confirmation instead of its old "Saved chats are
+    kept" wording. A pre-existing bug where the RAG status line always
+    read "undefined — undefined segment(s) indexed." was also fixed:
+    `/api/rag/status` returns `{"status": {...}}`, and the refresh()
+    function was reading `st.path`/`st.chunks` off the wrapper instead of
+    `st.status`.
+
+  - DOCS RE-SYNC. `documentation/_make_snapshot.py` + this v1-11 delta;
+    `APP_SNAPSHOT.md` regenerated (49 files, 11 changelogs); README's RAG
+    maintenance note now mentions the chat-header button; the toolkit
+    integration log gained a ROUND 5 entry.
+
+=================================================================
+ 2. FILE: static/chat.html                          (CHANGED - THIS ROUND)
+=================================================================
+Three additions (no existing code removed):
+
+   2.1  HEADER BUTTON - inserted immediately after the `sc-delete`
+        button inside `.sc-header-actions`:
+
+            <button
+                type="button"
+                class="sc-header-btn danger"
+                id="sc-rag-clear"
+                title="Reset the RAG memory store (all RAG DB entries reset to zero)">
+                <span>∅</span>
+                <span class="label">Clear Memory</span>
+            </button>
+
+   2.2  DOM REGISTRY - `ragClearButton` added after `deleteButton`:
+
+            ragClearButton:
+                document.getElementById(
+                    "sc-rag-clear"
+                )
+
+   2.3  HANDLER + WIRING. New async function `handleClearRagMemory()`
+        placed right before `window.__scActions = {` (mirroring the
+        existing `handleDeleteChat` pattern - same fetch/confirm style):
+
+            async function handleClearRagMemory() {
+                const confirmed =
+                    window.confirm(
+                        "Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero."
+                    );
+                if (!confirmed) { return; }
+                try {
+                    const response =
+                        await fetch("/api/rag/reset", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" }
+                        });
+                    if (!response.ok) {
+                        const body = await response.json().catch(() => ({}));
+                        throw new Error(
+                            String(body.detail || "") ||
+                            `Server error ${response.status}`
+                        );
+                    }
+                    const result = await response.json();
+                    setSaveStatus(
+                        result.message ||
+                            "RAG memory cleared - all RAG DB entries reset to zero.",
+                        "ok"
+                    );
+                } catch (error) {
+                    setSaveStatus(
+                        `Clear RAG memory failed: ${error.message}`,
+                        "error"
+                    );
+                }
+            }
+
+        ...and the event listener alongside the Save/Delete wiring:
+
+            DOM.ragClearButton.addEventListener(
+                "click",
+                handleClearRagMemory
+            );
+
+The button intentionally calls the existing store endpoint
+(`POST /api/rag/reset` -> `app/rag_commit.purge_store`), so the
+chat page and config page now share one "wipe the store" path.
+
+=================================================================
+ 3. FILE: static/js/ui/config-form.js               (CHANGED - THIS ROUND)
+=================================================================
+Two small edits inside `buildRagStoreManager()`:
+
+   3.1  refresh() status-line bug fix. `/api/rag/status` returns
+        `{"status": {...}}`, but refresh() read `st.path` / `st.chunks`
+        (undefined on the wrapper object), so the info line always
+        rendered "RAG store: undefined — undefined segment(s) indexed.".
+        Now it unwraps first:
+
+            -   info.textContent = `RAG store: ${st.path} — ${st.chunks} segment(s) indexed.`;
+            +   const status = st.status || st;
+            +   info.textContent = `RAG store: ${status.path} — ${status.chunks} segment(s) indexed.`;
+
+   3.2  purge ("Forget everything") confirmation dialog wording replaced
+        so both UIs warn identically that the store resets to zero:
+
+            -   if (!window.confirm("Forget everything in the RAG memory store? Saved chats are kept.")) {
+            +   if (!window.confirm("Are you sure you want to clear the RAG memory?\nAll RAG DB entries will be reset to zero.")) {
+
+No other changes: the `resetRag()` / `rebuildRag()` calls, the button
+labels ("Forget everything" / "Rebuild memory"), the `ragStatus()`
+import and the per-run refresh() all work as before.
+
+=================================================================
+ 4. FILE: documentation/_make_snapshot.py           (CHANGED - THIS ROUND)
+=================================================================
+   4.1  Module + section docstrings updated: the "change-log archive"
+        range notes bumped to "(v1-1 .. v1-11)".
+   4.2  CHANGELOGS list gains v1-11 (11 entries).
+   4.3  `build_archive()` Section 3 header text bumped to
+        "(v1-1 .. v1-11)".
+   4.4  TREE (Section 1): a `the_entire_enchilada_v1-11.txt` row added to
+        the documentation/ listing right after the v1-10 row.
+   4.5  The snapshot opener bullet (line ~289) bumped to
+        "(v1-1 .. v1-11)".
+   4.6  DOCSCRIPT_PROMPT refreshed: changelog list runs to v1-11; the
+        "next delta" example becomes `the_entire_enchilada_v1-12.txt`.
+
+=================================================================
+ 5. FILE: documentation/APP_SNAPSHOT.md             (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits): Section 2 re-embeds the 49-file manifest incl. the
+updated `chat.html` and `config-form.js`; Section 3 archives 11
+changelogs (v1-1 .. v1-11).
+
+=================================================================
+ 6. FILE: documentation/TOOLKIT_INTEGRATION_LOG.md  (CHANGED - THIS ROUND)
+=================================================================
+Gained a ROUND 5 entry at the top (dated September 7, 2026)
+documenting the chat-header "Clear Memory" button, the shared
+reset-to-zero confirmation dialog on the config page, and the RAG
+status-line fix. The header date line now reads "September 6, 2026
+(ROUND 4 / ROUND 5: September 7, 2026)".
+
+=================================================================
+ 7. FILE: README.md                                 (CHANGED - THIS ROUND)
+=================================================================
+One line under "RAG memory store" -> "Manual maintenance":
+
+    - **Manual maintenance:** `python scripts/rebuild_rag.py
+      [build|purge|status]`, the "Rebuild memory"/"Forget everything"
+      buttons in Configuration, or the "Clear Memory" button in the
+      chat header (`static/chat.html`).
+
+The trailing note about the store keeping embeddings after transcripts
+are deleted now also cross-references the chat-header button as the
+quick way to wipe it.
+
+=================================================================
+ 8. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `node --check static/js/ui/config-form.js` passes.
+   - Both inline `<script>` blocks of `static/chat.html` extracted and
+     `node --check`'d - pass (incl. the new `handleClearRagMemory`).
+   - `grep` confirms the new identifiers exist exactly once each:
+     `sc-rag-clear` (button + DOM lookup), `ragClearButton`,
+     `handleClearRagMemory`, and the "reset to zero" confirm text in
+     both `chat.html` and `config-form.js`.
+   - `/api/rag/reset`, `/api/rag/rebuild`, `/api/rag/status` endpoints
+     confirmed present in server.py (unchanged this round - the new
+     button just calls the existing one).
+   - `python documentation/_make_snapshot.py` runs clean: 49 files /
+     11 changelogs, APP_SNAPSHOT.md regenerated.
+   - Manual smoke check omitted deliberately: clicking the button
+     requires a running server; the handler path is identical to the
+     existing, working config-page `resetRag()` flow.
+
+=================================================================
+ 9. FILES NOT CHANGED (confirmed this round)
+=================================================================
+   - server.py, all of app/ (incl. app/core, app/agents, app/tools,
+     app/chat_store, app/paths.py, app/rag_commit.py)
+   - rag/ (ingest.py, search.py, main.py)
+   - agent_library/* (all agents, agent.md + agent.json)
+   - config/models.json, config/settings.json, static/config/app_settings.json
+   - static/index.html, static/css/*, static/js/app.js, api.js,
+     static/js/classes/*, static/js/logic/*, static/js/ui/agents.js,
+     config.js, markdown.js, appearance.js, chat-tests.js
+   - scripts/version_chats.py, scripts/rebuild_rag.py
+   - requirements.txt
+   - the_entire_enchilada.txt and v1.txt .. v1-10.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 10. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-11.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-10.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (backend under `app/`
+   and `rag/`, frontend under `static/`, plus config, requirements.txt,
+   scripts, agent_library/) against the versions/descriptions captured
+   in `the_entire_enchilada_v1-11.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-12.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).

@@ -5,12 +5,10 @@
   "mode": "agent",
   "model": "gemma4:e2b",
   "tools": [
-    "create_folder",
-    "create_file",
-    "setup_venv",
     "read_file",
-    "write_file",
-    "read_pdf",
+    "write_text_file",
+    "map_files",
+    "delete_files",
     "get_current_date",
     "tell_me_the_date_and_time",
     "search_chat_logs"

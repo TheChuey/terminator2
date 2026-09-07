@@ -1,0 +1,324 @@
+=================================================================
+ the_entire_enchilada_v1-10.txt
+ UPDATES SINCE: the_entire_enchilada_v1-9.txt
+ SCOPE:         NET DELTA ONLY (what actually changed vs V1.9)
+=================================================================
+
+This file chronicles ONLY the changes made to the live project since
+`the_entire_enchilada_v1-9.txt` was produced. It is not a full dump of
+the code. Each section below lists what changed for one file, the exact
+deltas, and any new code that was added. Files that did NOT change are
+listed at the end so it is clear nothing was missed.
+
+=================================================================
+ 1. THE BIG CHANGE (summarized)
+=================================================================
+The tool-calling layer was consolidated and the file reader rebuilt
+around IBM Docling:
+
+  - TOOLS FOLDER COLLAPSED 13 -> 3 FILES. A full audit found the legacy
+    modules (files.py, workspace.py, datetime_tools.py, search.py,
+    web.py, the untracked file_map.py / file_reader.py / file_writer.py /
+    file_delete.py / file_session.py, and test_agent_toolkit.py)
+    contained overlapping, dead, or conflicting code - two `read_file`s,
+    `write_file` vs `write_text_file`, `read_pdf` duplicated inside
+    `file_reader.read_file`, and a stub `search_chat_logs` in rag/
+    search.py. Everything now lives in two modules plus the registry:
+
+        app/tools/state.py    -> ALL classes (FileSession)
+        app/tools/tools.py    -> ALL 7 tools, one function each
+        app/tools/registry.py -> unchanged public API, 7 registered IDs
+
+  - READ TOOL NOW USES IBM DOCLING. Plain text / code files (.txt, .md,
+    .log, ...) are still read directly off disk (fast path). Every other
+    format - PDF, DOCX, PPTX, XLSX, HTML, images - is converted by
+    `docling` into clean, structured markdown. OCR is ON by default
+    (scanned PDFs work out of the box); the converter is created once per
+    process and reused. First-ever conversion downloads the layout/OCR
+    model artifacts from HuggingFace and can take minutes; subsequent
+    calls are fast. `pypdf` is no longer needed.
+
+  - REGISTRY SHRANK 12 -> 7 TOOLS. Removed: `write_file`, `read_pdf`,
+    `create_folder`, `create_file`, `setup_venv` (all covered by the
+    consolidated read/write tools). Kept: `map_files`, `read_file`,
+    `write_text_file`, `delete_files`, `get_current_date`,
+    `tell_me_the_date_and_time`, `search_chat_logs`.
+
+  - DOCS RE-SYNC. `documentation/_make_snapshot.py` + this v1-10 delta;
+    `APP_SNAPSHOT.md` regenerated (49 files, 10 changelogs);
+    README.md + CREATING_AGENTS.md tool tables updated; the toolkit
+    integration log gained a ROUND 4 entry.
+
+=================================================================
+ 2. FILE: app/tools/state.py                       (NEW FILE)
+=================================================================
+All classes in one module. `FileSession` moved from the deleted
+`app/tools/file_session.py` with an expanded, purpose-documenting class
+docstring. Same six state lists and the same public methods
+(`add_discovered`, `select_files`, `record_read`, `add_output`,
+`mark_for_deletion`, `get_state`) - no behavior change.
+
+=================================================================
+ 3. FILE: app/tools/tools.py                       (NEW FILE)
+=================================================================
+The consolidated home of every tool. One plain function per tool; the
+docstrings were rewritten so they carry what the LLM needs (Ollama turns
+name + signature + docstring into the tool schema, and PromptManager
+uses the first line for the AVAILABLE TOOLS prompt section).
+
+   3.1  `read_file(path: str, ocr: bool = True) -> dict`
+
+           _is_plain_text() fast path for .txt/.md/.log/code/csv/json/...
+           otherwise:
+               converter = _docling_converter(ocr)   # cached per ocr flag
+               result = converter.convert(str(p), max_num_pages=400)
+               if result.status is ConversionStatus.FAILURE:
+                   ... error dict with result.errors ...
+               content = result.document.export_to_markdown()
+
+        Returns the SAME data shape as before (`path`, `filename`,
+        `file_type`, `extracted_content`, `status`) so
+        `factory._record_result` and session injection are untouched.
+
+   3.2  `map_files(path, max_depth=8, max_entries=5000)` - as before
+        (os.walk pruning + depth/entry caps); the dead
+        `pretty_print_tree` helper is gone.
+
+   3.3  `write_text_file(name, content, output_path, overwrite=False)` -
+        as before; its `mkdir(parents=True)` absorbs the removed
+        workspace create_folder / create_file tools.
+
+   3.4  `delete_files(file_list, approved=False)` - as before (two-step
+        approval; runtime gate in factory.py is retained).
+
+   3.5  `get_current_date()` / `tell_me_the_date_and_time()` - moved
+        from datetime_tools.py, docstrings expanded.
+
+   3.6  `search_chat_logs(query)` + private `_auto_ingest_enabled()` /
+        `_ensure_rag_ingested()` helpers - moved from search.py,
+        unchanged logic.
+
+=================================================================
+ 4. FILE: app/tools/registry.py                    (CHANGED - THIS ROUND)
+=================================================================
+Full rewrite. Consumes `app.tools.tools` instead of the deleted modules;
+the public API and behavior are byte-for-byte the same:
+
+    _TOOL_REGISTRY = {
+        "map_files": map_files,
+        "read_file": read_file,
+        "write_text_file": write_text_file,
+        "delete_files": delete_files,
+        "get_current_date": get_current_date,
+        "tell_me_the_date_and_time": tell_me_the_date_and_time,
+        "search_chat_logs": search_chat_logs,
+    }
+
+`get()`, `list_tools()`, `available_tool_ids()`, `resolve_tools()`,
+`get_session()` unchanged. The shared `_session = FileSession()`
+instance now imports FileSession from `app.tools.state`.
+
+=================================================================
+ 5. DELETED FILES                                  (THIS ROUND)
+=================================================================
+The following modules were removed (implementations consolidated into
+tools.py / state.py; no dead code, stubs, or broken test harness kept):
+
+    app/tools/datetime_tools.py
+    app/tools/files.py            (legacy read_file/write_file/read_pdf)
+    app/tools/search.py
+    app/tools/web.py              (empty placeholder)
+    app/tools/workspace.py
+    app/tools/file_map.py         (was untracked on disk)
+    app/tools/file_reader.py      (was untracked on disk)
+    app/tools/file_writer.py      (was untracked on disk)
+    app/tools/file_delete.py      (was untracked on disk)
+    app/tools/file_session.py     (was untracked on disk)
+    app/tools/test_agent_toolkit.py (was untracked on disk; imported
+        `from file_map import ...` and would not even run)
+
+=================================================================
+ 6. FILE: app/core/agent.py                        (CHANGED - THIS ROUND)
+=================================================================
+One import line only:
+
+    - from app.tools.file_session import FileSession
+    + from app.tools.state import FileSession
+
+=================================================================
+ 7. FILE: app/agents/factory.py                    (CHANGED - THIS ROUND)
+=================================================================
+Same one-line import swap inside `_record_result`:
+
+    - from app.tools.file_session import FileSession
+    + from app.tools.state import FileSession
+
+No other change: `resolve_tools`, `get_session`, `_session_aware`, the
+delete-approval gate (keyed on the tool name `delete_files` and the
+`data["pending_files"]` key), and `_record_result` (keyed on `map_files`
+/ `read_file` / `write_text_file` / `delete_files`) all keep working
+because every surviving tool name and response shape is unchanged.
+
+=================================================================
+ 8. FILE: requirements.txt                          (CHANGED - THIS ROUND)
+=================================================================
+Added after the chromadb line:
+
+    docling>=2.59.0
+
+(2.59.0 is the first release with Python 3.14 support; 2.126.0 installed
+in the venv during verification. Docling brings its own PDF/office/
+OCR engines, so no separate pypdf dependency is needed - there was none
+in requirements.txt.)
+
+=================================================================
+ 9. FILE: agent_library/dev_assistant/agent.json   (CHANGED - THIS ROUND)
+=================================================================
+The "tools" array shrank from 9 IDs to the 7 consolidated ones:
+
+    - create_folder, create_file, setup_venv, write_file, read_pdf
+    + map_files, delete_files
+
+Before:
+    "tools": [ "create_folder", "create_file", "setup_venv",
+               "read_file", "write_file", "read_pdf",
+               "get_current_date", "tell_me_the_date_and_time",
+               "search_chat_logs" ]
+After:
+    "tools": [ "read_file", "write_text_file", "map_files",
+               "delete_files", "get_current_date",
+               "tell_me_the_date_and_time", "search_chat_logs" ]
+
+Functionally equivalent: write_text_file mkdir -p's folders, read_file
+handles PDFs via Docling, and delete_files replaces the ad-hoc single
+file steps. agent_library/rag_assistant/agent.json was already using
+only kept tools and needed NO change.
+
+=================================================================
+ 10. FILE: documentation/CREATING_AGENTS.md        (CHANGED - THIS ROUND)
+=================================================================
+   - "Available tools" table replaced with the 7 current tools, all
+     sourced from tools.py (map_files, read_file w/ Docling + OCR note,
+     write_text_file, delete_files, get_current_date,
+     tell_me_the_date_and_time, search_chat_logs).
+   - Example agent.json `"tools"` arrays updated: `write_file` ->
+     `write_text_file` (two occurrences).
+   - "To add a new tool" guidance now points at `app/tools/tools.py`
+     + `TOOL_REGISTRY` in registry.py.
+
+=================================================================
+ 11. FILE: README.md                               (CHANGED - THIS ROUND)
+=================================================================
+   - tools/ tree block: five legacy file rows replaced with
+     `state.py` (FileSession) + `tools.py` (the 7 tools) under registry.py.
+   - "Adding a new tool" section: "right category module (files.py,
+     workspace.py, ...)" replaced with "`app/tools/tools.py`".
+
+=================================================================
+ 12. FILE: documentation/_make_snapshot.py         (CHANGED - THIS ROUND)
+=================================================================
+   12.1  FILES manifest: the five legacy tool rows
+         (files.py, workspace.py, datetime_tools.py, search.py, web.py)
+         replaced by `app/tools/state.py` + `app/tools/tools.py`
+         (49 embedded files total).
+   12.2  TREE (Section 1): tools/ block now reads
+         `registry.py` / `state.py` / `tools.py`; a
+         `the_entire_enchilada_v1-10.txt` row was added to the
+         documentation/ listing.
+   12.3  CHANGELOGS list gains v1-10 (10 entries); the Section 3 header
+         and the opener bullet now read "(v1-1 .. v1-10)".
+   12.4  DOCSCRIPT_PROMPT refreshed: changelog list runs to v1-10; the
+         "next delta" example becomes `the_entire_enchilada_v1-11.txt`.
+
+=================================================================
+ 13. FILE: documentation/APP_SNAPSHOT.md           (REGENERATED)
+=================================================================
+Rewritten from scratch by `python documentation/_make_snapshot.py`
+(no hand edits): Section 2 embeds the 49-file manifest incl. the new
+`state.py` / `tools.py`; Section 3 archives 10 changelogs (v1-1 .. v1-10).
+
+=================================================================
+ 14. FILE: documentation/TOOLKIT_INTEGRATION_LOG.md (CHANGED - THIS ROUND)
+=================================================================
+Gained a ROUND 4 entry at the top documenting the consolidation + Docling
+work, and the now-stale "Current tool registry (12 tools)" table +
+"Notes for the Future" were updated to the 7-tool / tools.py reality.
+
+=================================================================
+ 15. VERIFICATION PERFORMED THIS ROUND
+=================================================================
+   - `python -m compileall app` - passes (state.py, tools.py, registry.py
+     included).
+   - Tools import + resolve: `registry.list_tools()` returns exactly the
+     7 kept IDs; every tool's docstring first line renders in the
+     AVAILABLE TOOLS prompt format.
+   - Smoke tests: read_file on a .txt (fast path) and on a generated
+     one-page PDF via Docling (`## Hello Docling World` extracted;
+     first conversion ~216s incl. one-time HF model downloads, cached
+     afterwards); write_text_file mkdir + write; map_files listing;
+     delete_files pending-approval shape.
+   - `build_agent('basic_chat')` (0 tools), `build_agent('rag_assistant')`
+     (6 tools), `build_agent('dev_assistant')` (7 tools) all build.
+   - `python -m unittest rag.test_app -v` - 5/5 pass.
+   - `python documentation/_make_snapshot.py` ran clean: 49 files / 10
+     changelogs, APP_SNAPSHOT.md regenerated.
+   - Grep confirms no remaining imports of the deleted tool modules in
+     live code; the only old-path references left live inside the
+     historical changelog archives (intentionally unmodified).
+
+=================================================================
+ 16. FILES NOT CHANGED (confirmed this round)
+=================================================================
+   - app/core/llm.py, app/core/prompt.py
+   - app/agents/loader.py, app/agents/registry.py
+   - app/chat_store/__init__.py, app/chat_store/logger.py,
+     app/chat_store/store.py
+   - app/rag_commit.py, app/paths.py, rag/ingest.py, rag/search.py,
+     rag/main.py
+   - agent_library/basic_chat/*, agent_library/rag_assistant/*
+     (except rag_assistant/agent.md which carried PRE-EXISTING
+     uncommitted edits unrelated to this round),
+     agent_library/problem_discovery_agent/*
+   - config/settings.json
+   - static/* (all frontend)
+   - scripts/version_chats.py, scripts/rebuild_rag.py
+   - the_entire_enchilada.txt and v1.txt .. v1-9.txt (historical
+     archives, intentionally kept unmodified)
+
+=================================================================
+ 17. AI PROMPT FOR THE NEXT STEP
+=================================================================
+You are producing the next revision of a project's change log. Read the
+file `the_entire_enchilada_v1-10.txt`. It is an "updates only" (NET DELTA
+ONLY) change log that archives every change made to the live project up
+until the moment it was written, keyed to the previously archived
+baseline (the_entire_enchilada_v1-9.txt). It is NOT a full source dump;
+it describes each changed file, the exact deltas, and the new/added
+code, plus an explicit list of files that did NOT change.
+
+Your task, in the exact same style and format:
+
+1. Diff every live source file under the project (backend under `app/`
+   and `rag/`, frontend under `static/`, plus config, requirements.txt,
+   scripts, agent_library/) against the versions/descriptions captured
+   in `the_entire_enchilada_v1-10.txt`.
+
+2. Write a new file for this next revision (continue the naming
+   convention, e.g. `the_entire_enchilada_v1-11.txt`). Include:
+   - A header banner naming this revision and the file it diffs against.
+   - A short summary of the overarching change(s) for this round.
+   - Per-file sections listing ONLY the net deltas (added, removed,
+     reworded, renamed code; new files; copy/UI text changes). Quote the
+     exact new code or the before/after text where relevant.
+   - An explicit "FILES NOT CHANGED" section so nothing is assumed.
+   - END BY APPENDING A FRESH copy of this same style of AI prompt, but
+     reworded so it instructs the NEXT revision (read THIS new file and
+     produce the one after it), keeping the self-perpetuating workflow
+     alive.
+
+Rules:
+- Report ONLY net changes; never restate code that is unchanged.
+- Never invent changes you cannot verify in the actual source files.
+- Do not modify any source file; only create the new change-log file.
+- Match the formatting conventions used throughout the source log
+  (`====...====` dividers, `FILE:` + deltas sub-headers, concise prose).
