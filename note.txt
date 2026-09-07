@@ -1,0 +1,162 @@
+TERMINATOR 2 — TOOL REGISTRY REPAIR + STABILITY NOTES
+=====================================================
+Date: September 6, 2026
+
+ROUND 1 — TOOL REGISTRY REPAIR
+------------------------------
+1. Fixed app/tools/registry.py (was broken):
+   - Removed duplicate/conflicting imports
+   - Restored the missing `resolve_tools()` function factory.py needs
+     (this caused an ImportError for any non-chat agent)
+   - Restored `available_tool_ids()` alias
+   - Collapsed redundant _TOOL_MAP / TOOL_REGISTRY into one dict
+
+2. Re-registered ALL legacy tools alongside the 4 new file tools:
+   - NEW:    map_files, read_file, write_text_file, delete_files
+   - LEGACY: write_file, read_pdf, create_folder, create_file, setup_venv,
+             get_current_date, tell_me_the_date_and_time, search_chat_logs
+   (12 tools total)
+
+3. Integrated FileSession into the runtime.
+
+ROUND 2 — RE-EVALUATION + STABILITY FIXES (this round)
+------------------------------------------------------
+REVIEWED the "my tools work now" state and found the ROOT CAUSE of the original
+`map_files() got an unexpected keyword argument 'args'` bug:
+
+   The _session_aware() wrapper in factory.py used `wrapper(*args, **kwargs)`.
+   Ollama builds each tool's JSON schema from the function signature, so the
+   model was told the only params were "args"/"kwargs" (both strings!) and
+   correctly sent {"args": [...]}. The 'defensive' *args/**kwargs tool edits
+   made this WORSE - the model got zero guidance about real params.
+
+FIXES MADE:
+1. app/tools/file_map.py / file_reader.py / file_writer.py / file_delete.py
+   - Reverted defensive *args/**kwargs signatures back to explicit typed params
+   - Added Google-style `Args:` docstring blocks (these become the per-param
+     descriptions Ollama puts in the tool schema)
+
+2. app/agents/factory.py — _session_aware()
+   - Now uses @functools.wraps(func) + __signature__/__annotations__ copy
+   - IMPACT: tool schema now advertises the REAL parameters to the model
+
+3. app/core/agent.py — new _normalize_args() runtime defense layer
+   Handles the malformed shapes small models still send, in ONE place:
+   - JSON-string args -> parsed
+   - {"args": {...}} / {"arguments": {...}} single-key wrappers -> unwrapped
+   - positional list -> bound to the tool's real params by signature
+   - string booleans ("false"->False) -> coerced ONLY on params typed bool
+   - stray/unknown keys (e.g. "path" on a no-arg tool) -> dropped
+   Used by BOTH act() and _extract_text_tool_calls().
+
+4. app/core/agent.py — think() no longer returns silent ""
+   - Bounded tool-call loop (MAX_TOOL_ROUNDS = 6): if the model keeps issuing
+     tool calls instead of a text answer, they are EXECUTED and re-prompted,
+     never silently dropped. Falls back to a visible message if the model
+     never produces text.
+
+5. app/core/agent.py — FileSession context is SINGLE-SLOT
+   - _inject_session_context() now REPLACES the previous "CURRENT FILE SESSION
+     STATE" block instead of appending a new one every tool round (kills
+     duplicate-context context bloat).
+
+6. app/tools/file_map.py — map_files() can no longer hang the server
+   - Uses os.walk (prunes ignored dirs properly), max_depth (default 8) and
+     max_entries (default 5000); ignores .git/.venv/venv/node_modules/
+     __pycache__/.idea/.vscode.
+
+VERIFICATION (all passing)
+--------------------------
+- convert_function_to_tool() now emits correct schemas:
+  map_files{path,max_depth,max_entries}, read_file{path},
+  write_text_file{name,content,output_path,overwrite:bool},
+  delete_files{file_list,approved:bool} - with real descriptions.
+- arg normalization: {"args":[...]}, positional lists, JSON-string args,
+  "false"->False on bool params, name="yes" NOT mangled, stray keys dropped.
+- delete_files string "False" does NOT delete; "True" does.
+- think() terminates after 6 rounds with a visible fallback (no empty reply).
+- tool-call-then-answer flow returns the final text answer.
+- rag_assistant 6/6 tools, dev_assistant 9/9, basic_chat 0.
+- toolkit integration test passes; server.py imports (26 routes).
+
+FILES CHANGED
+-------------
+- app/tools/registry.py      (round 1)
+- app/agents/factory.py      (rounds 1+2)
+- app/core/agent.py          (rounds 1+2)
+- app/tools/file_map.py      (round 2 - typed sigs + os.walk pruning)
+- app/tools/file_reader.py   (round 2 - typed sigs)
+- app/tools/file_writer.py   (round 2 - typed sigs)
+- app/tools/file_delete.py   (round 2 - typed sigs)
+- documentation/TOOLKIT_INTEGRATION_LOG.md
+- note.txt                   (this file)
+
+STILL TODO / POSSIBLE ISSUES
+---------------------------
+- FileSession is process-global (shared across all chats). For per-user
+  isolation, instantiate per request instead of using get_session().
+- Ollama marks params with Python defaults as "required" (a known quirk of its
+  convert_function_to_tool); missing optional args fall back to Python defaults
+  at call time, so behavior is correct regardless.
+- pypdf must be installed (`pip install pypdf`) for read_file PDF support.
+- No path sandboxing: file tools can operate anywhere on disk. The delete flow
+  is approval-gated, but writes/reads are unconstrained.
+
+ROUND 3 — FIXING NARRATED (vs EXECUTED) TOOL CALLS
+--------------------------------------------------
+PROBLEM: In a real llama3.1:8b session, the model never actually executed the
+file tools. It wrote tool-call-shaped JSON IN ITS TEXT REPLY instead of using
+native tool calls, so none of the read/write/delete steps ran:
+
+   - "read_file" with a "parameters" key    -> extraction ignored "parameters"
+                                              (only arguments/args read) ->
+                                              emitted call with EMPTY args ->
+                                              "Missing required argument: 'path'"
+   - a JSON ARRAY of 13 read_file calls     -> json.loads() succeeded on the
+                                              array, but the code only accepted
+                                              dicts -> 0 calls executed, the
+                                              whole "read everything" step was
+                                              silently dropped
+   - delete_files("approved":"False")       -> empty args -> pending_deletion
+                                              never registered, so the later
+                                              user "yes" relied on the model
+                                              fabricating paths to delete
+   - the actual write step was Python code    -> extraction can't see Python,
+      write_text_file('x', log, 'dir')          so nothing was written
+
+FIXES MADE (Round 3):
+1. app/core/agent.py — _extract_text_tool_calls()
+   - Top-level JSON arrays of calls are now accepted (each element is a
+     candidate), plus objects wrapped under "tool_calls"/"calls"/"functions".
+   - The args key now accepts "parameters" in addition to "arguments"/"args".
+   - Added _has_required_args() validity gate: a call is only emitted when every
+     required (no-default) param is present. Narration that merely mentions a
+     tool name with junk args is never executed anymore.
+2. app/agents/factory.py — delete safety gate
+   - delete_files(approved=True) can now ONLY delete paths that were previously
+     proposed (approved=False) and recorded in session.pending_deletion.
+   - Invented/fabricated paths are rejected (data["rejected"]) instead of
+     deleted; if NO requested path was pending, the call is fully blocked.
+3. agent_library/rag_assistant/agent.md
+   - New "how to call tools" section: emit ONLY {"name","parameters"} JSON (or a
+     single JSON array), never Python/pseudo-code, never fabricated paths, only
+     reference paths from the session state.
+
+VERIFICATION (Round 3, all passing)
+-----------------------------------
+- extraction: single "parameters" call, single "arguments" call, 13-element
+  array -> 13 calls, wrapped {"tool_calls": [...]}, delete with string "False",
+  prose-only call, and rejection of: Python code, empty-args narration, unknown
+  tool names.
+- delete gate E2E with a real file: propose(approved=False) registers pending;
+  confirm(approved=True) deletes the pending file and REJECTS an invented path;
+  invent-only confirm is fully blocked; pending list pruned after deletion.
+- agents build; server.py imports; toolkit integration test passes.
+
+FILES CHANGED (Round 3)
+-----------------------
+- app/core/agent.py          (extraction: lists + parameters + validity gate)
+- app/agents/factory.py      (pending-only delete gate + _record_result helper)
+- agent_library/rag_assistant/agent.md (tool-calling guidance)
+- documentation/TOOLKIT_INTEGRATION_LOG.md
+- note.txt                   (this file)
